@@ -1,7 +1,11 @@
 accounts:
-  # Import on startup (skip if username exists)
-  # - username: "my_tiktok_user"
-  #   proxy_id: 1
-  #   password: "your_web_password"
-  #   status: "pending"
-  #   notes: "pilot account 1"
+  - username: "user1673074451623"
+    proxy_id: 1
+    password: "@LXQZHRn31"
+    notes: "test acc 1 - XanhCloud proxy 1"
+    status: "warming"
+  - username: "user4359100704432"
+    proxy_id: 2
+    password: "LCQ%K3fMyh"
+    notes: "test acc 2 - XanhCloud proxy 2"
+    status: "warming"
