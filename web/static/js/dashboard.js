@@ -81,7 +81,26 @@ function toast(message, type = "success") {
   el.className = `toast ${type}`;
   el.textContent = message;
   container.appendChild(el);
-  setTimeout(() => el.remove(), 4000);
+  if (type !== "loading") {
+    setTimeout(() => el.remove(), 4000);
+  }
+  return el;
+}
+
+function clearToast(el) {
+  if (el && el.parentNode) el.remove();
+}
+
+function setButtonLoading(btn, loading) {
+  if (!btn) return;
+  if (loading) {
+    btn.disabled = true;
+    btn.classList.add("loading");
+    btn.dataset.originalText = btn.textContent;
+  } else {
+    btn.disabled = false;
+    btn.classList.remove("loading");
+  }
 }
 
 function formatNum(n) {
@@ -667,49 +686,59 @@ async function lookupTikTokProfile() {
     return;
   }
   const btn = document.getElementById("btnLookupProfile");
-  if (btn) btn.disabled = true;
+  setButtonLoading(btn, true);
+  const toastEl = toast("Fetching TikTok profile\u2026", "loading");
   try {
-    toast("Fetching TikTok profile…");
     const r = await API.get(`/api/tiktok/profile/${encodeURIComponent(username)}`);
+    clearToast(toastEl);
     renderProfilePreview(preview, r.profile);
-    toast(`@${r.profile.username} — ${formatNum(r.profile.followers)} followers`);
+    toast(`@${r.profile.username} \u2014 ${formatNum(r.profile.followers)} followers`);
   } catch (e) {
+    clearToast(toastEl);
     if (preview) {
       preview.hidden = false;
       preview.innerHTML = `<span style="color:var(--danger)">${escapeHtml(e.message)}</span>`;
     }
     toast(e.message, "error");
   } finally {
-    if (btn) btn.disabled = false;
+    setButtonLoading(btn, false);
   }
 }
 
 async function syncAccountProfile(accountId) {
+  const btn = document.querySelector(`[data-action="sync"][data-id="${accountId}"]`);
+  setButtonLoading(btn, true);
+  const toastEl = toast("Syncing TikTok profile\u2026", "loading");
   try {
-    toast("Syncing TikTok profile…");
     const r = await API.post(`/api/actions/sync-profile/${accountId}`);
+    clearToast(toastEl);
     toast(`@${r.profile?.username || accountId}: ${formatNum(r.profile?.followers)} followers`);
     refreshAccounts();
     refreshStats();
   } catch (e) {
+    clearToast(toastEl);
     toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
   }
 }
 
 async function syncAllAccountProfiles() {
   const btn = document.getElementById("btnSyncAllProfiles");
-  if (btn) btn.disabled = true;
+  setButtonLoading(btn, true);
+  const toastEl = toast("Syncing all accounts from TikTok\u2026", "loading");
   try {
-    toast("Syncing all accounts from TikTok…");
     const r = await API.post("/api/accounts/sync-profiles");
+    clearToast(toastEl);
     const res = r.results || {};
     toast(`Synced ${res.synced || 0}, failed ${res.failed || 0}`);
     refreshAccounts();
     refreshStats();
   } catch (e) {
+    clearToast(toastEl);
     toast(e.message, "error");
   } finally {
-    if (btn) btn.disabled = false;
+    setButtonLoading(btn, false);
   }
 }
 
@@ -717,40 +746,59 @@ async function runAction(action, accountId) {
   if (action === "sync") {
     return syncAccountProfile(accountId);
   }
+  const btn = document.querySelector(`[data-action="${action}"][data-id="${accountId}"]`);
+  setButtonLoading(btn, true);
   const paths = {
     farm: `/api/actions/farm/${accountId}`,
     post: `/api/actions/post/${accountId}`,
     check: `/api/actions/check/${accountId}`,
   };
+  const toastEl = toast(`Starting ${action} for account ${accountId}\u2026`, "loading");
   try {
-    toast(`Starting ${action} for account ${accountId}…`);
     const result = await API.post(paths[action]);
-    toast(result.message || `${action} completed`, "success");
+    clearToast(toastEl);
+    toast(result.message || `${action} completed`);
     setTimeout(refreshAll, 2000);
   } catch (e) {
+    clearToast(toastEl);
     toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
   }
 }
 
 async function checkAllProxies() {
+  const btn = document.getElementById("btnProxyCheck");
+  setButtonLoading(btn, true);
+  const toastEl = toast("Checking proxies\u2026", "loading");
   try {
-    toast("Checking proxies…");
     const r = await API.post("/api/proxies/check");
+    clearToast(toastEl);
     const res = r.results || {};
     toast(`Proxies: ${res.alive ?? 0} alive, ${res.dead ?? 0} dead`);
     refreshProxies();
     refreshStats();
   } catch (e) {
+    clearToast(toastEl);
     toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
   }
 }
 
 async function rescheduleJobs() {
+  const btn = document.getElementById("btnReschedule");
+  setButtonLoading(btn, true);
+  const toastEl = toast("Rescheduling jobs\u2026", "loading");
   try {
     const r = await API.post("/api/scheduler/reschedule");
+    clearToast(toastEl);
     toast(r.message || "Jobs rescheduled");
   } catch (e) {
+    clearToast(toastEl);
     toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
   }
 }
 

@@ -514,6 +514,57 @@ body::before {
 
 .btn-sm { padding: 0.35rem 0.65rem; font-size: 0.75rem; }
 
+/* Loading state for action buttons */
+.actions .btn {
+  position: relative;
+  transition: all 0.2s ease;
+}
+.actions .btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+.actions .btn.loading {
+  pointer-events: none;
+  opacity: 0.7;
+  padding-left: 1.6rem;
+}
+.actions .btn.loading::before {
+  content: "";
+  position: absolute;
+  left: 0.35rem;
+  width: 0.65rem;
+  height: 0.65rem;
+  border: 2px solid transparent;
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: btn-spinner 0.5s linear infinite;
+}
+@keyframes btn-spinner {
+  to { transform: rotate(360deg); }
+}
+
+/* Toast with loading indicator */
+.toast.loading {
+  padding-left: 2.2rem;
+  border-left: 3px solid var(--info);
+}
+.toast.loading::before {
+  content: "";
+  position: absolute;
+  left: 0.6rem;
+  top: 50%;
+  margin-top: -0.45rem;
+  width: 0.8rem;
+  height: 0.8rem;
+  border: 2px solid rgba(255,255,255,0.2);
+  border-top-color: var(--info);
+  border-radius: 50%;
+  animation: toast-spinner 0.6s linear infinite;
+}
+@keyframes toast-spinner {
+  to { transform: rotate(360deg); }
+}
+
 /* Hidden on desktop (sidebar always visible); shown in mobile breakpoint below */
 .btn.menu-toggle {
   display: none;
