@@ -190,6 +190,71 @@ class ProxyManager:
         alive = self.get_alive_proxies()
         return random.choice(alive) if alive else None
 
+    def get_proxy_by_db_id(self, proxy_id: int) -> Optional[Proxy]:
+        """Match proxy by CSV/DB id (1-based index in loaded list)."""
+        for p in self._proxies:
+            if p.id == proxy_id:
+                return p
+        return None
+
+    async def ensure_proxy_for_account(self, account, account_manager) -> tuple:
+        """Check proxy before browser use; rotate to another alive proxy if dead.
+
+        Returns:
+            (proxy_url or None, proxy_id or None)
+        """
+        proxy_id = account.proxy_id or 0
+        proxy = self.get_proxy_by_db_id(proxy_id) if proxy_id else None
+
+        if proxy:
+            alive = await self.check_proxy(proxy)
+            self.save_to_csv()
+            if alive:
+                return proxy.url, proxy.id
+            logger.warning(
+                f"Proxy {proxy.ip}:{proxy.port} dead for account {account.id}, rotating"
+            )
+        else:
+            logger.warning(f"Account {account.id} has no proxy, assigning one")
+
+        new_id = await self.rotate_proxy_for_account(account.id, account_manager, exclude_id=proxy_id)
+        if not new_id:
+            return None, None
+        new_proxy = self.get_proxy_by_db_id(new_id)
+        return (new_proxy.url, new_id) if new_proxy else (None, None)
+
+    async def rotate_proxy_for_account(
+        self,
+        account_id: int,
+        account_manager,
+        exclude_id: int = 0,
+    ) -> Optional[int]:
+        """Assign next alive proxy to account. Returns new proxy_id."""
+        candidates = [
+            p for p in self.get_alive_proxies() if p.id != exclude_id
+        ]
+        if not candidates:
+            dead = [p for p in self._proxies if p.id != exclude_id and p.status != "dead"]
+            for p in dead:
+                if await self.check_proxy(p):
+                    candidates.append(p)
+            self.save_to_csv()
+
+        if not candidates:
+            logger.error(f"No alive proxy available for account {account_id}")
+            account_manager.add_alert(
+                account_id, "proxy_fail", "No alive proxy available after rotation"
+            )
+            return None
+
+        import random
+        chosen = random.choice(candidates)
+        account_manager.assign_proxy(account_id, chosen.id)
+        logger.info(
+            f"Rotated account {account_id} to proxy {chosen.ip}:{chosen.port} (id={chosen.id})"
+        )
+        return chosen.id
+
     # ---- Health Checks ----
 
     async def check_proxy(self, proxy: Proxy) -> bool:
@@ -247,35 +312,49 @@ class ProxyManager:
         logger.info(f"Proxy health check complete: {alive} alive, {dead} dead, {errors} errors")
         return {"alive": alive, "dead": dead, "errors": errors}
 
-    def sync_proxies_to_db(self, db_path: str):
-        """Sync current proxy list to SQLite database."""
-        import sqlite3
+    def sync_proxies_to_db(self, db):
+        """Sync current proxy list to database (SQLite or PostgreSQL)."""
         try:
-            conn = sqlite3.connect(db_path)
+            conn = db.connect()
             cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS proxies (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ip TEXT NOT NULL,
-                    port INTEGER NOT NULL,
-                    protocol TEXT DEFAULT 'http',
-                    username TEXT,
-                    password TEXT,
-                    status TEXT DEFAULT 'active',
-                    last_checked TIMESTAMP,
-                    fail_count INTEGER DEFAULT 0
-                )
-            """)
-            cursor.execute("DELETE FROM proxies")  # Clear and re-insert
+
+            if db.is_sqlite:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS proxies (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ip TEXT NOT NULL,
+                        port INTEGER NOT NULL,
+                        protocol TEXT DEFAULT 'http',
+                        username TEXT,
+                        password TEXT,
+                        status TEXT DEFAULT 'active',
+                        last_checked TIMESTAMP,
+                        fail_count INTEGER DEFAULT 0
+                    )
+                """)
+
+            cursor.execute(db.sql("DELETE FROM proxies"))
+            insert_sql = db.sql(
+                "INSERT INTO proxies (ip, port, protocol, username, password, status, last_checked, fail_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            )
             for p in self._proxies:
                 cursor.execute(
-                    "INSERT INTO proxies (ip, port, protocol, username, password, status, last_checked, fail_count) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (p.ip, p.port, p.protocol, p.username, p.password, p.status, p.last_checked, p.fail_count),
+                    insert_sql,
+                    (
+                        p.ip,
+                        p.port,
+                        p.protocol,
+                        p.username,
+                        p.password,
+                        p.status,
+                        p.last_checked,
+                        p.fail_count,
+                    ),
                 )
             conn.commit()
             conn.close()
-            logger.info(f"Synced {len(self._proxies)} proxies to DB")
+            logger.info(f"Synced {len(self._proxies)} proxies to DB ({db.driver})")
         except Exception as e:
             logger.error(f"Failed to sync proxies to DB: {e}")
 

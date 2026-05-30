@@ -14,6 +14,7 @@ Pillow>=10.1.0
 
 # Database
 aiosqlite>=0.19.0
+psycopg2-binary>=2.9.9
 
 # Web
 jinja2>=3.1.2
@@ -24,5 +25,8 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 tenacity>=8.2.0
 
-# Camoufox (anti-detect browser)
-# camoufox>=0.3.0  # Uncomment when Camoufox is available
+# Camoufox (anti-detect browser) — optional, enable in settings camoufox.use_camoufox
+# camoufox>=0.4.0
+
+# Redis (APScheduler job store when redis.enabled=true)
+redis>=5.0.0

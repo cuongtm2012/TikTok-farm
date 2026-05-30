@@ -5,7 +5,14 @@ app:
   log_level: "INFO"
 
 database:
-  path: "data/farm.db"
+  # driver: sqlite | postgresql
+  driver: postgresql
+  path: "data/farm.db"   # used when driver=sqlite
+  host: localhost
+  port: 5433
+  name: tiktok_farm
+  user: tiktok_farm
+  password: tiktok_farm_secret
 
 proxies:
   csv_path: "config/proxies.csv"
@@ -21,14 +28,30 @@ scheduler:
     - ["14:00", "17:00"]
     - ["19:00", "22:00"]
 
-content:
-  images_per_post: 5
-  output_dir: "data/posts/"
-
 camoufox:
   headless: true
   profile_dir: "profiles/"
   navigation_timeout: 30000
+  use_camoufox: false   # true when pip install camoufox
+
+redis:
+  enabled: false
+  host: localhost
+  port: 6379
+  db: 0
+  password: ""
+
+warmup:
+  days: 7
+  auto_assign_proxy: true
+
+accounts:
+  yaml_path: "config/accounts.yaml"
+
+content:
+  images_per_post: 5
+  output_dir: "data/posts/"
+  default_affiliate_link: ""
 
 health_check:
   interval_minutes: 60

@@ -39,7 +39,26 @@ tiktok-farm/
 
 ## Quick Start
 
-### 1. Install dependencies
+### 1. PostgreSQL (Docker)
+
+```bash
+cp .env.example .env
+docker compose up -d
+docker compose ps   # wait until healthy
+```
+
+Default: `postgresql://tiktok_farm:tiktok_farm_secret@localhost:5433/tiktok_farm`  
+Schema is applied automatically from `docker/postgres/init/01-schema.sql`.
+
+To use SQLite instead (no Docker), set in `config/settings.yaml`:
+
+```yaml
+database:
+  driver: sqlite
+  path: data/farm.db
+```
+
+### 2. Install dependencies
 
 ```bash
 cd tiktok-farm
@@ -47,11 +66,11 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. Configure
+### 3. Configure
 
 Edit `config/settings.yaml`:
-- Set your database path, proxy CSV, and timing parameters
-- Enable Telegram alerts by adding your bot token and chat ID
+- `database.driver`: `postgresql` (Docker) or `sqlite` (local file)
+- Proxy CSV, timing parameters, Telegram bot token
 
 Add proxies to `config/proxies.csv`:
 ```csv
@@ -59,14 +78,14 @@ ip,port,protocol,username,password,status
 1.2.3.4,8080,http,,,active
 ```
 
-### 3. Add accounts
+### 4. Add accounts
 
 Via API or directly:
 ```bash
 curl -X POST "http://localhost:8000/api/accounts?username=myaccount&proxy_id=1"
 ```
 
-### 4. Run
+### 5. Run
 
 With web dashboard:
 ```bash
@@ -134,7 +153,7 @@ All actions have random delays mimicking human behavior.
 - **Playwright** for browser automation
 - **Pillow** for image compositing
 - **APScheduler** for job scheduling
-- **SQLite** (pilot) / PostgreSQL-ready schema
+- **PostgreSQL** (Docker, default) / **SQLite** (pilot, no Docker)
 - **Chart.js** for dashboard visualizations
 - **Camoufox** target for anti-detect (Firefox-based)
 

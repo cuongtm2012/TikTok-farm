@@ -4,7 +4,8 @@
 import asyncio
 import logging
 import random
-from typing import Optional, List, Dict
+from collections import defaultdict
+from typing import Optional, List, Dict, Set
 from datetime import datetime, timedelta, time
 from pathlib import Path
 
@@ -20,6 +21,24 @@ try:
 except ImportError:
     APSCHEDULER_AVAILABLE = False
     logger.warning("APScheduler not installed. Scheduler disabled.")
+
+
+def _build_jobstores(settings: dict) -> dict:
+    redis_cfg = settings.get("redis", {})
+    if redis_cfg.get("enabled"):
+        try:
+            from apscheduler.jobstores.redis import RedisJobStore
+            return {
+                "default": RedisJobStore(
+                    host=redis_cfg.get("host", "localhost"),
+                    port=int(redis_cfg.get("port", 6379)),
+                    db=int(redis_cfg.get("db", 0)),
+                    password=redis_cfg.get("password") or None,
+                )
+            }
+        except Exception as e:
+            logger.warning(f"Redis jobstore unavailable, using memory: {e}")
+    return {"default": MemoryJobStore()}
 
 
 class FarmScheduler:
@@ -39,17 +58,25 @@ class FarmScheduler:
         post_engine,
         health_monitor,
         settings: dict,
+        proxy_manager=None,
+        session_service=None,
+        warmup_manager=None,
     ):
         self.account_mgr = account_manager
         self.farm_engine = farm_engine
         self.post_engine = post_engine
         self.health_monitor = health_monitor
+        self.proxy_mgr = proxy_manager
+        self.session_svc = session_service
+        self.warmup_mgr = warmup_manager
         self.settings = settings
 
         self._scheduler: Optional[AsyncIOScheduler] = None
         self._running = False
-        self._retry_counts: Dict[str, int] = {}  # job_id -> retry count
+        self._retry_counts: Dict[str, int] = {}
         self._max_retries = 3
+        self._account_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._farm_active: Set[int] = set()
 
         # Scheduler config
         scheduler_config = settings.get("scheduler", {})
@@ -66,6 +93,9 @@ class FarmScheduler:
         health_config = settings.get("health_check", {})
         self.health_interval = health_config.get("interval_minutes", 60)
 
+        content_cfg = settings.get("content", {})
+        self.default_affiliate_link = content_cfg.get("default_affiliate_link", "")
+
     def start(self):
         """Start the APScheduler."""
         if not APSCHEDULER_AVAILABLE:
@@ -77,17 +107,18 @@ class FarmScheduler:
             return
 
         try:
-            jobstores = {"default": MemoryJobStore()}
-
+            jobstores = _build_jobstores(self.settings)
+            store_name = "redis" if self.settings.get("redis", {}).get("enabled") else "memory"
             self._scheduler = AsyncIOScheduler(jobstores=jobstores, timezone="UTC")
             self._scheduler.start()
             self._running = True
-            logger.info("Farm scheduler started")
+            logger.info(f"Farm scheduler started (jobstore={store_name})")
 
-            # Schedule health checks
+            if self.warmup_mgr:
+                self.warmup_mgr.run_daily_tick()
+
             self._schedule_health_checks()
-
-            # Schedule daily jobs for all accounts
+            self._schedule_warmup_tick()
             self._schedule_daily_jobs()
 
         except Exception as e:
@@ -107,6 +138,23 @@ class FarmScheduler:
         )
         logger.info(f"Scheduled health checks every {self.health_interval} minutes")
 
+    def _schedule_warmup_tick(self):
+        if not self._scheduler or not self.warmup_mgr:
+            return
+        self._scheduler.add_job(
+            self._run_warmup_tick,
+            CronTrigger(hour=0, minute=5),
+            id="warmup_daily",
+            name="Daily Warm-up Tick",
+            replace_existing=True,
+        )
+
+    async def _run_warmup_tick(self):
+        if self.warmup_mgr:
+            result = self.warmup_mgr.run_daily_tick()
+            logger.info(f"Warm-up tick: {result}")
+            self.reschedule_all()
+
     def _schedule_daily_jobs(self):
         """Schedule daily farm and post jobs for all accounts."""
         if not self._scheduler:
@@ -114,7 +162,9 @@ class FarmScheduler:
 
         # Get all active accounts
         accounts = self.account_mgr.get_all_accounts()
-        active_accounts = [a for a in accounts if a.status in ("active", "warming")]
+        active_accounts = [
+            a for a in accounts if a.status in ("active", "warming", "pending")
+        ]
 
         for account in active_accounts:
             self.schedule_account_daily(account.id)
@@ -235,36 +285,60 @@ class FarmScheduler:
         job_id = f"farm_{account_id}"
         logger.info(f"Starting farm session for account {account_id}")
 
+        if account_id in self._farm_active:
+            logger.info(f"Farm already running for account {account_id}, skip duplicate")
+            return
+
+        async with self._account_locks[account_id]:
+            self._farm_active.add(account_id)
+            try:
+                await self._run_farm_session_body(account_id, job_id)
+            finally:
+                self._farm_active.discard(account_id)
+
+    async def _run_farm_session_body(self, account_id: int, job_id: str):
         try:
             account = self.account_mgr.get_account(account_id)
             if not account or account.status in ("banned", "shadowbanned", "paused"):
-                logger.warning(f"Account {account_id} not eligible for farm session (status: {account.status if account else 'N/A'})")
+                logger.warning(
+                    f"Account {account_id} not eligible for farm "
+                    f"(status: {account.status if account else 'N/A'})"
+                )
                 return
 
-            # Get proxy for this account
-            proxy = None
-            if account.proxy_id:
-                from src.proxy_manager import ProxyManager
-                pm = ProxyManager.from_settings(self.settings)
-                pm.load_from_csv()
-                proxy_obj = pm.get_proxy(account.proxy_id)
-                if proxy_obj and proxy_obj.is_alive:
-                    proxy = proxy_obj.url
+            session = await self._prepare_session(account_id)
+            if not session.get("ok"):
+                await self._handle_retry(job_id, account_id, "farm_session")
+                return
 
-            # Randomize actions a bit
-            actions = {
-                "scroll": True,
-                "like": random.randint(2, 5),
-                "comment": random.randint(0, 2),
-                "follow": random.randint(0, 2),
-                "watch": random.randint(3, 6),
-            }
+            account = session["account"]
+            if account.status == "pending" and self.warmup_mgr:
+                self.warmup_mgr.promote_pending_accounts()
 
-            # Run the farm session
+            if self.warmup_mgr and account.status == "warming":
+                wp = self.warmup_mgr.get_actions_for_account(account)
+                actions = {
+                    "scroll": wp["scroll"],
+                    "like": wp["like"],
+                    "comment": wp["comment"],
+                    "follow": wp["follow"],
+                    "watch": wp["watch"],
+                }
+                duration = wp["duration_minutes"]
+            else:
+                actions = {
+                    "scroll": True,
+                    "like": random.randint(2, 5),
+                    "comment": random.randint(0, 2),
+                    "follow": random.randint(0, 2),
+                    "watch": random.randint(3, 6),
+                }
+                duration = self.farm_session_minutes
+
             session_stats = await self.farm_engine.run_farm_session(
                 account_id=account_id,
-                proxy_url=proxy,
-                duration_minutes=self.farm_session_minutes,
+                proxy_url=session["proxy_url"],
+                duration_minutes=duration,
                 actions=actions,
             )
 
@@ -300,16 +374,48 @@ class FarmScheduler:
             logger.error(f"Farm session error for account {account_id}: {e}", exc_info=True)
             await self._handle_retry(job_id, account_id, "farm_session")
 
+    async def _prepare_session(self, account_id: int) -> Dict:
+        if self.session_svc:
+            return await self.session_svc.prepare(account_id)
+        account = self.account_mgr.get_account(account_id)
+        return {"ok": bool(account), "account": account, "proxy_url": None, "cookie_data": None, "username": "", "password": ""}
+
     async def _execute_post(self, account_id: int):
         """Execute a post upload for an account."""
         job_id = f"post_{account_id}"
         logger.info(f"Starting post upload for account {account_id}")
 
+        if account_id in self._farm_active:
+            logger.info(f"Farm in progress for {account_id}, deferring post (priority: farm > post)")
+            if self._scheduler:
+                retry_time = datetime.now() + timedelta(minutes=15)
+                self._scheduler.add_job(
+                    self._execute_post,
+                    DateTrigger(run_date=retry_time),
+                    args=[account_id],
+                    id=f"{job_id}_defer_{int(retry_time.timestamp())}",
+                    name=f"Deferred post account {account_id}",
+                )
+            return
+
+        async with self._account_locks[account_id]:
+            await self._run_post_body(account_id, job_id)
+
+    async def _run_post_body(self, account_id: int, job_id: str):
         try:
             account = self.account_mgr.get_account(account_id)
             if not account or account.status != "active":
-                logger.warning(f"Account {account_id} not active (status: {account.status if account else 'N/A'})")
+                logger.warning(
+                    f"Account {account_id} not active (status: {account.status if account else 'N/A'})"
+                )
                 return
+
+            session = await self._prepare_session(account_id)
+            if not session.get("ok"):
+                await self._handle_retry(job_id, account_id, "post")
+                return
+
+            account = session["account"]
 
             # Get content pipeline
             from src.content_pipeline import ContentPipeline
@@ -349,21 +455,22 @@ class FarmScheduler:
 
             caption = random.choice(captions)
             hashtags = " ".join(selected_tags)
-            affiliate_link = ""
+            affiliate_link = self.default_affiliate_link or ""
 
-            # Upload the post
             upload_result = await self.post_engine.upload_slideshow(
                 account_id=account_id,
                 images_dir=post_dir,
                 caption=caption,
                 hashtags=hashtags,
                 affiliate_link=affiliate_link,
-                username=account.username,
+                username=session.get("username") or account.username,
+                password=session.get("password") or getattr(account, "password", ""),
+                cookie_data=session.get("cookie_data") or account.cookie_data,
+                proxy_url=session.get("proxy_url"),
             )
 
             if upload_result.get("success"):
-                # Record the post in database
-                self.account_mgr.add_post(
+                post_id = self.account_mgr.add_post(
                     account_id=account_id,
                     content_path=post_dir,
                     caption=caption,
@@ -371,8 +478,11 @@ class FarmScheduler:
                     affiliate_link=affiliate_link,
                     scheduled_at=datetime.now().isoformat(),
                 )
+                if post_id and upload_result.get("tiktok_post_id"):
+                    self.account_mgr.mark_post_posted(
+                        post_id, tiktok_post_id=upload_result["tiktok_post_id"]
+                    )
 
-                # Update account stats
                 account = self.account_mgr.get_account(account_id)
                 self.account_mgr.update_account(
                     account_id,
@@ -459,12 +569,24 @@ class FarmScheduler:
         self._running = False
 
     @classmethod
-    def from_settings(cls, settings: dict, account_manager, farm_engine, post_engine, health_monitor) -> "FarmScheduler":
-        """Create instance from settings dict."""
+    def from_settings(
+        cls,
+        settings: dict,
+        account_manager,
+        farm_engine,
+        post_engine,
+        health_monitor,
+        proxy_manager=None,
+        session_service=None,
+        warmup_manager=None,
+    ) -> "FarmScheduler":
         return cls(
             account_manager=account_manager,
             farm_engine=farm_engine,
             post_engine=post_engine,
             health_monitor=health_monitor,
             settings=settings,
+            proxy_manager=proxy_manager,
+            session_service=session_service,
+            warmup_manager=warmup_manager,
         )

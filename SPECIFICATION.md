@@ -1,17 +1,18 @@
-# TikTok Farm - System Specification v1.0
+# TikTok Farm - System Specification v1.1
 
 ## Tổng quan
 Hệ thống tự động quản lý nhiều tài khoản TikTok: nuôi acc tự nhiên, tạo nội dung slideshow, đăng bài affiliate.
 Pilot: 5 acc → Scale: 100 acc.
 
 ## Tech stack
-- **Anti-Detect:** Camoufox (Python bindings, Firefox-based, C++ stealth, free)
+- **Anti-Detect:** Camoufox (optional, `camoufox.use_camoufox: true`) hoặc Playwright Chromium (default)
 - **Automation:** Playwright Python (async)
 - **Image Processing:** Pillow (PIL)
-- **Scheduler:** APScheduler + Redis 
-- **Dashboard:** FastAPI + Chart.js + SQLite (pilot), PostgreSQL (scale)
-- **Database:** SQLite (pilot) / PostgreSQL (scale)
-- **Server:** Linux VPS Ubuntu 22.04+
+- **Scheduler:** APScheduler + Redis job store (optional) hoặc MemoryJobStore
+- **Dashboard:** FastAPI + Chart.js + HTML
+- **Database:** SQLite (pilot) / PostgreSQL (scale, Docker)
+- **Cache/Queue:** Redis 7 (Docker, optional)
+- **Server:** Linux VPS Ubuntu 22.04+ / macOS dev
 
 ---
 
@@ -25,163 +26,107 @@ Pilot: 5 acc → Scale: 100 acc.
 │  Proxy   │ Content  │ Schedule  │ Farm                │
 │  Mgr     │ Pipeline │  Engine   │ Behavior Engine     │
 ├─────────┼──────────┼──────────┼──────────────────────┤
-│ Camoufox│ Pillow   │ Queue    │ Playwright +         │
-│ + Proxy │ Template │ (Redis)  │ Camoufox browser     │
+│ Camoufox│ Pillow   │ Redis     │ Playwright +         │
+│ /Chromium│ Template │ (optional)│ SessionService       │
 └─────────┴──────────┴──────────┴──────────────────────┘
+         SessionService ──► proxy check + cookie persist
+         WarmupManager  ──► 7-day warm-up orchestration
 ```
+
+---
 
 ## II. Modules
 
 ### 1. Proxy Manager (`proxy_manager.py`)
 - Quản lý danh sách proxy (file CSV hoặc DB)
-- Check proxy alive trước khi dùng
-- Bind 1 proxy → 1 account profile
-- Auto-rotate proxy khi fail
-- Storage format: `{"ip": "1.2.3.4", "port": 8080, "protocol": "http/socks5", "username": "", "password": "", "status": "active/banned/dead"}`
+- Check proxy alive (`check_proxy`, `check_all_proxies`)
+- Bind 1 proxy → 1 account (`proxy_id`)
+- **Auto-rotate** khi fail (`ensure_proxy_for_account`, `rotate_proxy_for_account`)
+- Sync CSV ↔ DB
 
 ### 2. Account Manager (`account_manager.py`)
 - CRUD tài khoản TikTok
-- Mỗi acc = 1 profile Camoufox riêng biệt (fingerprint + proxy + cookie)
-- Lưu trạng thái: active, warming, banned, shadowbanned, paused
-- Auto warm-up sequence (7 ngày đầu)
-- Storage: `account_id, username, proxy_id, status, follower_count, created_at, last_active, notes`
+- Status: `pending`, `warming`, `active`, `banned`, `shadowbanned`, `paused`
+- **Cookie persistence** (`cookie_data`, `save_cookies`)
+- **Password** field (optional, cho web login)
+- Import từ `config/accounts.yaml` (`load_accounts_from_yaml`)
+- Warm-up: `complete_warming()` sau N ngày
+- Posts, alerts, farm_activities, stats
 
 ### 3. Browser Profile Factory (`browser_manager.py`)
-- Singleton quản lý Camoufox instances
-- Factory method: `create_browser(account_id, headless=True)` 
-- Tự động apply fingerprint + proxy cho mỗi profile
-- Quản lý lifecycle (open, close, recycle)
-- Cơ chế reuse instance nếu đang chạy task kế tiếp
+- Singleton quản lý browser instances
+- `create_browser(account_id)` — alias của `create_context`
+- Camoufox khi `use_camoufox: true`, fallback Chromium
+- Proxy per context, `storage_state` per account trong `profiles/{id}/`
+- Lifecycle: open, close, recycle
 
-### 4. Farm Behavior Engine (`farm_engine.py`)
-Behavior scripts chạy để nuôi acc như người thật:
-- `scroll_feed(duration_minutes=10)` — scroll, random dừng, xem video
-- `like_videos(count=5, topic="")` — like video theo chủ đề
-- `comment_random(comment_pool=["Nice!", "Great content!"])` — comment tủ
-- `follow_accounts(count=3)` — follow theo tỷ lệ (không follow ồ ạt)
-- `watch_video_full(min_seconds=15, max_seconds=60)` — xem video hết
-- Schedule mỗi phiên: 10-15 phút, 2-3 phiên/ngày, random giờ
+### 4. Session Service (`session_service.py`) — **mới v1.1**
+- `prepare(account_id)`: check proxy, rotate nếu dead, trả credentials + proxy_url
+- `save_cookies`: persist session sau login/upload
 
-### 5. Content Pipeline (`content_pipeline.py`)
-Tạo slideshow ảnh tự động:
-- Đầu vào: folder ảnh product + brand logo
-- Layout template: `product_photo | rating_stars (4.5/5) | review_text | brand_logo`
-- Output: folder `/posts/{account_id}/{timestamp}/` gồm 3-5 ảnh
-- Config: `templates.yaml` để customize layout
+### 5. Warm-up Manager (`warmup_manager.py`) — **mới v1.1**
+- `pending` → `warming` (khi có proxy)
+- Hành vi farm scale theo ngày 1–7 (`WARMUP_DAY_PROFILES`)
+- `warming` → `active` sau `warmup.days`
+- Cron daily tick + chạy lúc startup
 
-### 6. Post Engine (`post_engine.py`)
-Dùng Camoufox + Playwright để:
-- Login TikTok web (giữ session)
-- Upload slideshow (chọn nhiều ảnh)
-- Điền caption + hashtag
-- Tag sản phẩm affiliate (từ link TikTok Shop)
-- Random giờ đăng trong khung cho phép
+### 6. Farm Behavior Engine (`farm_engine.py`)
+- `scroll_feed`, `like_videos`, `comment_random`, `follow_accounts`, `watch_video_full`
+- `run_farm_session` — duration/actions config-driven
+- Warm-up accounts dùng profile ngày tương ứng
 
-### 7. Scheduler (`scheduler.py`)
-APScheduler-based:
-- Queue jobs cho mỗi account
-- 3 post/ngày/account, random giờ (sáng 8-11, chiều 14-17, tối 19-22)
-- Farm sessions: 2-3/ngày, random
-- Retry queue khi fail (tối đa 3 lần)
-- Priority queue: ưu tiên farm behavior > post
+### 7. Content Pipeline (`content_pipeline.py`)
+- Slideshow từ product + brand + rating + review
+- Output: `data/posts/{account_id}/{timestamp}/`
+- `templates.yaml`
 
-### 8. Health Monitor (`health_monitor.py`)
-Check định kỳ (1 lần/giờ):
-- Account còn alive? (login check)
-- Bị shadowban? (view count trên post gần nhất)
-- Rate limit? (error response từ TikTok)
-- Alert qua Telegram khi phát hiện bất thường
+### 8. Post Engine (`post_engine.py`)
+- Login: session / cookies / username+password
+- **Persist cookies** + `storage_state` sau login
+- Upload slideshow, caption, hashtags, affiliate link
+- Trả `tiktok_post_id` khi detect được từ URL
 
-### 9. Dashboard API (`api/` và `web/`)
-FastAPI backend + React/Chart.js frontend:
-- `GET /api/accounts` — list accounts + status
-- `GET /api/accounts/{id}/stats` — per-account metrics
-- `GET /api/performance` — tổng hợp: total posts, total views, avg engagement
-- `GET /api/health` — system health + alerts
-- Web UI: real-time charts, account table, alert log
+### 9. Scheduler (`scheduler.py`)
+- APScheduler async
+- **Redis job store** khi `redis.enabled: true`
+- 3 post/ngày, 2–3 farm/ngày, random time slots
+- Retry max 3, exponential backoff
+- **Priority:** farm > post (defer post nếu farm đang chạy)
+- Per-account `asyncio.Lock`
+- Tích hợp SessionService, WarmupManager
 
-### 10. Database Schema
-```sql
--- accounts
-CREATE TABLE accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    proxy_id INTEGER REFERENCES proxies(id),
-    status TEXT DEFAULT 'pending',  -- pending, warming, active, banned, shadowbanned, paused
-    followers INTEGER DEFAULT 0,
-    following INTEGER DEFAULT 0,
-    total_posts INTEGER DEFAULT 0,
-    total_views INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_active TIMESTAMP,
-    cookie_data TEXT,  -- JSON
-    notes TEXT
-);
+### 10. Health Monitor (`health_monitor.py`)
+- Login check, shadowban (views vs followers), rate limit
+- **Banned detection** (`check_account_banned`)
+- Hashtag visibility check (best-effort, `check_hashtag_visibility`)
+- Telegram alerts
 
--- proxies
-CREATE TABLE proxies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ip TEXT NOT NULL,
-    port INTEGER NOT NULL,
-    protocol TEXT DEFAULT 'http',
-    username TEXT,
-    password TEXT,
-    status TEXT DEFAULT 'active',
-    last_checked TIMESTAMP,
-    fail_count INTEGER DEFAULT 0
-);
+### 11. Dashboard API (`web/api.py`, `web/templates/`)
+- `GET /api/accounts`, `/accounts/{id}/stats`, `/performance`, `/health`
+- `GET /api/alerts?resolved=0|1` — lọc resolved
+- HTML + Chart.js dashboard
 
--- posts
-CREATE TABLE posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id INTEGER REFERENCES accounts(id),
-    tiktok_post_id TEXT,
-    content_path TEXT,
-    caption TEXT,
-    hashtags TEXT,
-    affiliate_link TEXT,
-    status TEXT DEFAULT 'pending',  -- pending, posted, failed, deleted
-    views INTEGER DEFAULT 0,
-    likes INTEGER DEFAULT 0,
-    comments INTEGER DEFAULT 0,
-    shares INTEGER DEFAULT 0,
-    scheduled_at TIMESTAMP,
-    posted_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+### 12. Database
+- SQLite file hoặc PostgreSQL (Docker)
+- Schema: `accounts`, `proxies`, `posts`, `farm_activities`, `alerts`
+- `accounts.password` (PostgreSQL migration `02-alter-accounts.sql`)
 
--- farm_activities
-CREATE TABLE farm_activities (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id INTEGER REFERENCES accounts(id),
-    activity_type TEXT,  -- scroll, like, comment, follow, watch
-    duration_seconds INTEGER,
-    actions_count INTEGER,
-    performed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- alerts
-CREATE TABLE alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id INTEGER REFERENCES accounts(id),
-    alert_type TEXT,  -- shadowban, rate_limit, banned, login_fail
-    message TEXT,
-    resolved INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
+---
 
 ## III. Cấu trúc thư mục
 
 ```
 tiktok-farm/
 ├── config/
-│   ├── settings.yaml          # Main config: DB path, API keys, timing
-│   ├── proxies.csv             # Danh sách proxy
-│   ├── templates.yaml          # Content layout templates
-│   └── accounts.yaml           # Danh sách account (hoặc qua DB)
+│   ├── settings.yaml
+│   ├── proxies.csv
+│   ├── templates.yaml
+│   └── accounts.yaml
 ├── src/
-│   ├── main.py                 # Entry point (FastAPI app)
+│   ├── main.py
+│   ├── database.py
+│   ├── session_service.py      # v1.1
+│   ├── warmup_manager.py       # v1.1
 │   ├── proxy_manager.py
 │   ├── account_manager.py
 │   ├── browser_manager.py
@@ -192,103 +137,154 @@ tiktok-farm/
 │   ├── health_monitor.py
 │   └── telegram_alert.py
 ├── web/
-│   ├── api.py                  # FastAPI routes
-│   ├── templates/              # HTML templates
-│   └── static/                 # JS, CSS
+│   ├── api.py
+│   └── templates/index.html
+├── docker/
+│   └── postgres/init/
+├── docker-compose.yml          # postgres + redis
 ├── data/
-│   ├── farm.db                 # SQLite database
-│   ├── proxies.csv
-│   └── posts/                  # Generated content
 ├── content/
-│   ├── products/               # Product images
-│   ├── brands/                 # Brand logos
-│   └── templates/              # Overlay templates
-├── profiles/                   # Camoufox browser profiles
-├── logs/
-│   └── farm.log
-├── requirements.txt
-└── README.md
+├── profiles/
+└── logs/
 ```
 
-## IV. Config mẫu (settings.yaml)
+---
+
+## IV. Config mẫu (`settings.yaml`)
 
 ```yaml
-app:
-  name: "TikTok Farm"
-  version: "1.0.0"
-  debug: false
-  log_level: "INFO"
-
 database:
-  path: "data/farm.db"
+  driver: postgresql   # hoặc sqlite
+  host: localhost
+  port: 5433
+  name: tiktok_farm
+  user: tiktok_farm
+  password: tiktok_farm_secret
 
-proxies:
-  csv_path: "config/proxies.csv"
-  check_timeout: 5
-  max_fail_before_disable: 3
+camoufox:
+  use_camoufox: false
+  headless: true
+  profile_dir: "profiles/"
+
+redis:
+  enabled: false
+  host: localhost
+  port: 6379
+
+warmup:
+  days: 7
+  auto_assign_proxy: true
+
+accounts:
+  yaml_path: "config/accounts.yaml"
+
+content:
+  default_affiliate_link: ""
 
 scheduler:
   posts_per_day: 3
   farm_sessions_per_day: 3
-  farm_session_minutes: 15
   post_time_slots:
     - ["08:00", "11:00"]
     - ["14:00", "17:00"]
     - ["19:00", "22:00"]
-
-content:
-  images_per_post: 5
-  output_dir: "data/posts/"
-
-camoufox:
-  headless: true
-  profile_dir: "profiles/"
-  navigation_timeout: 30000
-
-health_check:
-  interval_minutes: 60
-  alert_on_shadowban: true
-  alert_on_rate_limit: true
-
-telegram:
-  enabled: false
-  bot_token: ""
-  chat_id: ""
 ```
 
-## V. Module dependencies
+---
+
+## V. Docker services
+
+```bash
+cp .env.example .env
+docker compose up -d    # postgres:5433, redis:6379
+```
+
+| Service | Image | Port mặc định |
+|---------|-------|----------------|
+| postgres | postgres:16-alpine | 5433 |
+| redis | redis:7-alpine | 6379 |
+
+---
+
+## VI. Module dependencies
 
 ```
 main.py
-├── scheduler.py → farm_engine.py, post_engine.py
-│   ├── browser_manager.py → Camoufox
-│   └── account_manager.py → DB
-├── content_pipeline.py → Pillow
-├── health_monitor.py → browser_manager, account_manager
-├── web/api.py → account_manager, health_monitor
-└── telegram_alert.py
+├── database.py
+├── session_service.py → proxy_manager, account_manager
+├── warmup_manager.py → account_manager, proxy_manager
+├── scheduler.py → farm_engine, post_engine, session_service, warmup_manager
+│   └── redis jobstore (optional)
+├── browser_manager.py → Camoufox | Chromium
+├── health_monitor.py
+└── web/api.py
 ```
 
-## VI. Quy tắc coding
-
-1. **Async-first** — sử dụng asyncio cho mọi I/O (browser calls, network)
-2. **Error handling** — mọi module có try/except, log lỗi, không crash app
-3. **Graceful cleanup** — đóng browser instances khi app shutdown
-4. **No hardcoded paths** — tất cả path từ settings.yaml
-5. **Config-driven** — behavior parameters trong settings.yaml, không hardcode
-6. **Thread safety** — Camoufox instances không share giữa các coroutines
+---
 
 ## VII. Pilot checklist (5 acc)
 
-- [ ] Code Proxy Manager + import proxies từ CSV
-- [ ] Code Account Manager + DB schema
-- [ ] Code Browser Manager (Camoufox integration)
-- [ ] Code Farm Engine (scroll, like, comment, watch, follow)
-- [ ] Code Content Pipeline (Pillow template)
-- [ ] Code Post Engine (login + upload + tag)
-- [ ] Code Scheduler (APScheduler jobs)
-- [ ] Code Health Monitor + Telegram alert
-- [ ] Code Dashboard API + Web UI
-- [ ] Test full flow với 1 account
-- [ ] Warm-up 5 accounts trong 7 ngày
-- [ ] Start posting thực tế
+| # | Hạng mục | Trạng thái |
+|---|----------|-----------|
+| 1 | Proxy Manager + CSV + rotate | ✅ |
+| 2 | Account Manager + DB + YAML import | ✅ |
+| 3 | Browser Manager (Camoufox optional) | ⚠️ Chromium default; bật Camoufox khi cài package |
+| 4 | Farm Engine | ✅ code; ⚠️ cần test TikTok thật |
+| 5 | Content Pipeline | ✅ |
+| 6 | Post Engine + cookie persist | ✅ code; ⚠️ cần test TikTok thật |
+| 7 | Scheduler + Redis optional | ✅ |
+| 8 | Health Monitor + Telegram | ✅ |
+| 9 | Dashboard API + UI | ✅ |
+| 10 | Warm-up 7 ngày orchestration | ✅ |
+| 11 | Test full flow 1 account | ❌ manual QA |
+| 12 | Posting thực tế | ❌ manual QA |
+
+---
+
+## VIII. Trạng thái implementation (v1.1)
+
+### ✅ Hoàn thiện
+- PostgreSQL + SQLite abstraction
+- Proxy check + auto-rotate
+- Session cookie/storage persist
+- Warm-up manager (7 ngày, scale actions)
+- Scheduler priority farm > post
+- Redis job store (config flag)
+- Alerts API filter resolved
+- `tiktok_post_id` lưu sau upload
+- Health: banned detection
+
+### ⚠️ Cần verify trên TikTok production
+- DOM selectors (login, upload, farm actions)
+- Camoufox anti-detect hiệu quả
+- Hashtag shadowban detection accuracy
+- CAPTCHA / 2FA flows
+
+### ❌ Chưa làm / ngoài scope v1.1
+- React dashboard (dùng HTML + Chart.js)
+- WebSocket real-time
+- E2E automated test suite
+- TikTok Shop API integration
+
+---
+
+## IX. Quy tắc coding
+
+1. **Async-first** — asyncio cho I/O
+2. **Error handling** — try/except + log, không crash app
+3. **Graceful cleanup** — đóng browser khi shutdown
+4. **Config-driven** — paths và timing từ `settings.yaml`
+5. **Thread safety** — per-account lock, không share browser context giữa coroutines
+
+---
+
+## X. Chạy nhanh
+
+```bash
+docker compose up -d
+pip install -r requirements.txt
+playwright install chromium
+python src/main.py
+```
+
+Dashboard: http://localhost:8000/api/dashboard

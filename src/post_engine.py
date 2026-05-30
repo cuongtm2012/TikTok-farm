@@ -23,9 +23,20 @@ class PostEngine:
     UPLOAD_URL = "https://www.tiktok.com/upload"
     LOGIN_URL = "https://www.tiktok.com/login"
 
-    def __init__(self, browser_manager):
+    def __init__(self, browser_manager, account_manager=None):
         self.browser = browser_manager
+        self.account_mgr = account_manager
         self._login_cache: Dict[int, bool] = {}  # account_id -> logged_in
+
+    async def _persist_session(self, account_id: int, page) -> None:
+        """Save cookies to DB and browser storage_state file."""
+        try:
+            cookies = await page.context.cookies()
+            if self.account_mgr and cookies:
+                self.account_mgr.save_cookies(account_id, cookies)
+            await self.browser.save_storage_state(account_id)
+        except Exception as e:
+            logger.warning(f"[Account {account_id}] Session persist failed: {e}")
 
     async def _ensure_login(
         self,
@@ -54,6 +65,7 @@ class PostEngine:
             if logged_in:
                 logger.info(f"[Account {account_id}] Already logged in")
                 self._login_cache[account_id] = True
+                await self._persist_session(account_id, page)
                 return True
 
             # Second try: use cookies if available
@@ -71,6 +83,7 @@ class PostEngine:
                         if logged_in:
                             logger.info(f"[Account {account_id}] Logged in via cookies")
                             self._login_cache[account_id] = True
+                            await self._persist_session(account_id, page)
                             return True
                 except Exception as e:
                     logger.warning(f"[Account {account_id}] Cookie login failed: {e}")
@@ -123,14 +136,7 @@ class PostEngine:
                 if logged_in:
                     logger.info(f"[Account {account_id}] Login successful")
                     self._login_cache[account_id] = True
-
-                    # Save cookies for next time
-                    try:
-                        cookies = await page.context.cookies()
-                        return True
-                    except Exception as e:
-                        logger.warning(f"[Account {account_id}] Failed to save cookies: {e}")
-
+                    await self._persist_session(account_id, page)
                     return True
                 else:
                     logger.warning(f"[Account {account_id}] Login failed - check credentials")
@@ -322,6 +328,8 @@ class PostEngine:
 
                 result["success"] = True
                 result["posted_at"] = datetime.now().isoformat()
+                result["tiktok_post_id"] = await self._extract_post_id(page)
+                await self._persist_session(account_id, page)
                 logger.info(f"[Account {account_id}] Slideshow posted successfully!")
             else:
                 result["error"] = "Could not find Post button"
@@ -374,6 +382,16 @@ class PostEngine:
         except Exception as e:
             logger.error(f"[Account {account_id}] Failed to get post stats: {e}")
             return None
+
+    async def _extract_post_id(self, page) -> Optional[str]:
+        """Try to read TikTok post id from URL after upload."""
+        try:
+            url = page.url
+            if "/video/" in url:
+                return url.split("/video/")[-1].split("?")[0]
+        except Exception:
+            pass
+        return None
 
     def clear_login_cache(self, account_id: Optional[int] = None):
         """Clear cached login state for an account (or all accounts)."""

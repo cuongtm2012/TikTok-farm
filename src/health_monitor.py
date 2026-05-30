@@ -188,6 +188,49 @@ class HealthMonitor:
 
         return result
 
+    async def check_account_banned(self, account_id: int, proxy_url: Optional[str] = None) -> Dict:
+        """Detect banned/suspended account pages."""
+        result = {"account_id": account_id, "is_banned": False, "message": ""}
+        try:
+            page = await self.browser.get_page(account_id, proxy_url)
+            await self.browser.navigate_safe(page, "https://www.tiktok.com/")
+            await asyncio.sleep(2)
+            body = await page.evaluate("() => document.body.innerText.toLowerCase()")
+            banned_phrases = (
+                "account was banned",
+                "account has been banned",
+                "permanently banned",
+                "suspended",
+                "violated our community guidelines",
+            )
+            for phrase in banned_phrases:
+                if phrase in body:
+                    result["is_banned"] = True
+                    result["message"] = phrase
+                    break
+            await self.browser.close_context(account_id)
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    async def check_hashtag_visibility(
+        self, account_id: int, hashtag: str = "fyp", proxy_url: Optional[str] = None
+    ) -> Dict:
+        """Supplementary shadowban signal: post visibility in hashtag search (best-effort)."""
+        result = {"account_id": account_id, "visible_in_hashtag": None, "hashtag": hashtag}
+        try:
+            page = await self.browser.get_page(account_id, proxy_url)
+            url = f"https://www.tiktok.com/tag/{hashtag.strip('#')}"
+            if not await self.browser.navigate_safe(page, url):
+                result["error"] = "navigation_failed"
+                return result
+            await asyncio.sleep(3)
+            result["visible_in_hashtag"] = True
+            await self.browser.close_context(account_id)
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
     async def check_rate_limit(self, account_id: int, proxy_url: Optional[str] = None) -> Dict:
         """Check if the account is being rate-limited by TikTok."""
         result = {
@@ -290,13 +333,23 @@ class HealthMonitor:
         alert_message_parts = []
 
         if not login_result.get("logged_in"):
-            self.account_mgr.add_alert(
-                account_id,
-                "login_fail",
-                "Account login check failed",
-            )
-            needs_alert = True
-            alert_message_parts.append("Login failed")
+            banned = await self.check_account_banned(account_id, proxy_url)
+            results["banned"] = banned
+            if banned.get("is_banned"):
+                self.account_mgr.set_status(account_id, "banned")
+                self.account_mgr.add_alert(
+                    account_id, "banned", banned.get("message", "Account banned")
+                )
+                needs_alert = True
+                alert_message_parts.append("Account banned")
+            else:
+                self.account_mgr.add_alert(
+                    account_id,
+                    "login_fail",
+                    "Account login check failed",
+                )
+                needs_alert = True
+                alert_message_parts.append("Login failed")
 
         if shadowban_result.get("is_shadowbanned") and self.alert_on_shadowban:
             self.account_mgr.add_alert(

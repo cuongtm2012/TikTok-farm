@@ -24,8 +24,11 @@ except ImportError:
     FASTAPI_AVAILABLE = False
 
 # Local imports
+from src.database import Database
 from src.proxy_manager import ProxyManager
 from src.account_manager import AccountManager
+from src.session_service import SessionService
+from src.warmup_manager import WarmupManager
 from src.browser_manager import BrowserManager
 from src.farm_engine import FarmEngine
 from src.content_pipeline import ContentPipeline
@@ -59,7 +62,7 @@ def load_settings(path: str = "config/settings.yaml") -> dict:
         logger.warning(f"Settings file not found at {path}, using defaults")
         return {
             "app": {"name": "TikTok Farm", "version": "1.0.0", "debug": False, "log_level": "INFO"},
-            "database": {"path": "data/farm.db"},
+            "database": {"driver": "sqlite", "path": "data/farm.db"},
             "proxies": {"csv_path": "config/proxies.csv", "check_timeout": 5, "max_fail_before_disable": 3},
             "scheduler": {"posts_per_day": 3, "farm_sessions_per_day": 3, "farm_session_minutes": 15,
                           "post_time_slots": [["08:00", "11:00"], ["14:00", "17:00"], ["19:00", "22:00"]]},
@@ -88,26 +91,37 @@ class AppState:
 
     def __init__(self, settings: dict):
         self.settings = settings
-        self.settings_path = Path(settings.get("database", {}).get("path", "data/farm.db"))
+        self.db = Database.from_settings(settings)
 
         # Initialize components
         self.telegram = TelegramAlert.from_settings(settings)
         self.proxy_manager = ProxyManager.from_settings(settings)
-        self.account_manager = AccountManager.from_settings(settings)
+        self.account_manager = AccountManager(db=self.db)
         self.browser_manager = BrowserManager.from_settings(settings)
         self.farm_engine = FarmEngine(self.browser_manager)
         self.content_pipeline = ContentPipeline.from_settings(settings)
-        self.post_engine = PostEngine(self.browser_manager)
+        self.post_engine = PostEngine(self.browser_manager, self.account_manager)
+        self.session_service = SessionService(self.account_manager, self.proxy_manager)
+        self.warmup_manager = WarmupManager(
+            self.account_manager, self.proxy_manager, settings
+        )
         self.health_monitor = HealthMonitor.from_settings(
             settings, self.account_manager, self.browser_manager, self.telegram
         )
         self.scheduler = FarmScheduler.from_settings(
-            settings, self.account_manager, self.farm_engine,
-            self.post_engine, self.health_monitor,
+            settings,
+            self.account_manager,
+            self.farm_engine,
+            self.post_engine,
+            self.health_monitor,
+            proxy_manager=self.proxy_manager,
+            session_service=self.session_service,
+            warmup_manager=self.warmup_manager,
         )
 
-        # Load proxies
         self.proxy_manager.load_from_csv()
+        accounts_yaml = settings.get("accounts", {}).get("yaml_path", "config/accounts.yaml")
+        self.account_manager.load_accounts_from_yaml(accounts_yaml)
 
         logger.info("All components initialized")
 
@@ -115,10 +129,12 @@ class AppState:
         """Start all services."""
         logger.info("Starting TikTok Farm services...")
 
-        # Sync proxies to DB
-        self.proxy_manager.sync_proxies_to_db(str(self.settings_path))
+        self.proxy_manager.sync_proxies_to_db(self.db)
 
-        # Start scheduler
+        if self.warmup_manager:
+            tick = self.warmup_manager.run_daily_tick()
+            logger.info(f"Warm-up on startup: {tick}")
+
         self.scheduler.start()
 
         # Send startup notification

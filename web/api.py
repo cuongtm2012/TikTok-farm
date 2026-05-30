@@ -342,13 +342,15 @@ async def trigger_check(request: Request, account_id: int):
 
 @router.get("/alerts")
 async def list_alerts(request: Request, resolved: Optional[int] = Query(None)):
-    """List alerts."""
+    """List alerts. resolved=0 unresolved, resolved=1 resolved, omit for all."""
     state = get_state(request)
     try:
-        alerts = state.account_manager.get_unresolved_alerts()
-        if resolved == 1:
-            # Return all alerts including resolved (simplified)
-            pass
+        if resolved is None:
+            alerts = state.account_manager.get_alerts(limit=100)
+        elif resolved == 1:
+            alerts = state.account_manager.get_alerts(resolved=True, limit=100)
+        else:
+            alerts = state.account_manager.get_alerts(resolved=False, limit=100)
         return {"success": True, "count": len(alerts), "alerts": alerts}
     except Exception as e:
         logger.error(f"Error listing alerts: {e}")

@@ -1,5 +1,7 @@
 accounts:
-  # Add accounts here or manage through the database/API
-  # - username: "user1"
+  # Import on startup (skip if username exists)
+  # - username: "my_tiktok_user"
   #   proxy_id: 1
+  #   password: "your_web_password"
   #   status: "pending"
+  #   notes: "pilot account 1"
