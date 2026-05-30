@@ -1,13 +1,18 @@
-# TikTok Farm - System Specification v1.1
+# TikTok Farm - System Specification v2.0
 
 ## Tổng quan
 Hệ thống tự động quản lý nhiều tài khoản TikTok: nuôi acc tự nhiên, tạo nội dung slideshow, đăng bài affiliate.
 Pilot: 5 acc → Scale: 100 acc.
 
+**Mô hình kiếm tiền:** Affiliate 2 lớp
+- **Lớp 1 (3-5 acc Real):** TikTok Shop Affiliate (CMND người thân) → nhận hoa hồng về ngân hàng
+- **Lớp 2 (95-97 acc Farm):** Tương tác kích thích engagement + bio link affiliate ngoài
+
 ## Tech stack
 - **Anti-Detect:** Camoufox (optional, `camoufox.use_camoufox: true`) hoặc Playwright Chromium (default)
 - **Automation:** Playwright Python (async)
 - **Image Processing:** Pillow (PIL)
+- **Video Processing:** ffmpeg-python
 - **Scheduler:** APScheduler + Redis job store (optional) hoặc MemoryJobStore
 - **Dashboard:** FastAPI + Chart.js + HTML
 - **Database:** SQLite (pilot) / PostgreSQL (scale, Docker)
@@ -19,16 +24,18 @@ Pilot: 5 acc → Scale: 100 acc.
 ## I. Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                     Main App                         │
-│  (FastAPI + APScheduler + SQLite/PostgreSQL)         │
-├─────────┬──────────┬──────────┬──────────────────────┤
-│  Proxy   │ Content  │ Schedule  │ Farm                │
-│  Mgr     │ Pipeline │  Engine   │ Behavior Engine     │
-├─────────┼──────────┼──────────┼──────────────────────┤
-│ Camoufox│ Pillow   │ Redis     │ Playwright +         │
-│ /Chromium│ Template │ (optional)│ SessionService       │
-└─────────┴──────────┴──────────┴──────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                      Main App                               │
+│  (FastAPI + APScheduler + SQLite/PostgreSQL)                │
+├────────┬──────────┬───────────┬──────────────┬──────────────┤
+│  Proxy │  Content │ Schedule  │    Farm      │ Affiliate    │
+│  Mgr   │ Pipeline │  Engine   │  Behavior    │ Pipeline     │
+├────────┼──────────┼───────────┼──────────────┼──────────────┤
+│Camo-   │ Pillow   │ Redis     │ Playwright + │ Scanner SP   │
+│fox     │ ffmpeg   │(optional) │ SessionSvc   │ ↓ Download   │
+│/Chrom  │ Template │           │              │ ↓ Edit video │
+│        │          │           │              │ ↓ Upload     │
+└────────┴──────────┴───────────┴──────────────┴──────────────┘
          SessionService ──► proxy check + cookie persist
          WarmupManager  ──► 7-day warm-up orchestration
 ```
@@ -60,11 +67,11 @@ Pilot: 5 acc → Scale: 100 acc.
 - Proxy per context, `storage_state` per account trong `profiles/{id}/`
 - Lifecycle: open, close, recycle
 
-### 4. Session Service (`session_service.py`) — **mới v1.1**
+### 4. Session Service (`session_service.py`)
 - `prepare(account_id)`: check proxy, rotate nếu dead, trả credentials + proxy_url
 - `save_cookies`: persist session sau login/upload
 
-### 5. Warm-up Manager (`warmup_manager.py`) — **mới v1.1**
+### 5. Warm-up Manager (`warmup_manager.py`)
 - `pending` → `warming` (khi có proxy)
 - Hành vi farm scale theo ngày 1–7 (`WARMUP_DAY_PROFILES`)
 - `warming` → `active` sau `warmup.days`
@@ -80,38 +87,55 @@ Pilot: 5 acc → Scale: 100 acc.
 - Output: `data/posts/{account_id}/{timestamp}/`
 - `templates.yaml`
 
-### 8. Post Engine (`post_engine.py`)
+### 8. Post Engine (`post_engine.py`) — **MỚI: hỗ trợ video**
 - Login: session / cookies / username+password
 - **Persist cookies** + `storage_state` sau login
+- **Upload video (mp4)** — mở rộng từ slideshow ảnh
 - Upload slideshow, caption, hashtags, affiliate link
 - Trả `tiktok_post_id` khi detect được từ URL
 
-### 9. Scheduler (`scheduler.py`)
+### 9. Affiliate Pipeline (`src/affiliate/`) — **MỚI v2.0**
+- **Scanner SP Trending** (`scanner.py`):
+  - Crawl TikTok Affiliate Marketplace tìm SP bán chạy, commission cao
+  - Lọc theo tiêu chí: niche, giá, commission %, doanh số
+- **Downloader** (`downloader.py`):
+  - Tải video mẫu từ TikTok hoặc nguồn khác
+  - Dùng yt-dlp / requests
+- **Video Editor** (`editor.py`):
+  - ffmpeg: cắt clip, ghép nhiều clip, thêm nhạc nền
+  - Pillow: text overlay, link QR, caption
+- **Uploader** (`uploader.py`):
+  - Gọi PostEngine để đăng video + link affiliate
+  - Lịch đăng riêng cho account Real vs Farm
+
+### 10. Scheduler (`scheduler.py`)
 - APScheduler async
 - **Redis job store** khi `redis.enabled: true`
-- 3 post/ngày, 2–3 farm/ngày, random time slots
+- 3 post/ngày (farm), 1-2 video/ngày (real), 2–3 farm/ngày, random time slots
 - Retry max 3, exponential backoff
 - **Priority:** farm > post (defer post nếu farm đang chạy)
 - Per-account `asyncio.Lock`
-- Tích hợp SessionService, WarmupManager
+- Tích hợp SessionService, WarmupManager, AffiliatePipeline
 
-### 10. Health Monitor (`health_monitor.py`)
+### 11. Health Monitor (`health_monitor.py`)
 - Login check, shadowban (views vs followers), rate limit
 - **Banned detection** (`check_account_banned`)
 - Hashtag visibility check (best-effort, `check_hashtag_visibility`)
 - Telegram alerts
 
-### 11. Dashboard API (`web/api.py`, `web/templates/`)
+### 12. Dashboard API (`web/api.py`, `web/templates/`)
 - `GET /api/accounts`, `/accounts/{id}/stats`, `/performance`, `/health`
 - `GET /api/alerts?resolved=0|1` — lọc resolved
+- **Settings TikTok API** — ms_token input, save, test
 - **TikTok public profile** (optional, [davidteather/TikTok-Api](https://github.com/davidteather/TikTok-Api)):
   - `GET /api/tiktok/profile/{username}` — tra cứu followers/videos (không ghi DB)
   - `POST /api/accounts/{id}/sync-profile` — đồng bộ stats vào DB
   - `POST /api/accounts/sync-profiles` — đồng bộ hàng loạt
   - Cần `TIKTOK_MS_TOKEN` (cookie `msToken` từ tiktok.com)
 - HTML + Chart.js dashboard
+- **MỚI:** Tab Settings (ms_token config, test API)
 
-### 12. Database
+### 13. Database
 - SQLite file hoặc PostgreSQL (Docker)
 - Schema: `accounts`, `proxies`, `posts`, `farm_activities`, `alerts`
 - `accounts.password` (PostgreSQL migration `02-alter-accounts.sql`)
@@ -130,8 +154,8 @@ tiktok-farm/
 ├── src/
 │   ├── main.py
 │   ├── database.py
-│   ├── session_service.py      # v1.1
-│   ├── warmup_manager.py       # v1.1
+│   ├── session_service.py
+│   ├── warmup_manager.py
 │   ├── proxy_manager.py
 │   ├── account_manager.py
 │   ├── browser_manager.py
@@ -141,13 +165,22 @@ tiktok-farm/
 │   ├── scheduler.py
 │   ├── health_monitor.py
 │   ├── tiktok_profile.py       # optional TikTok-Api public stats
-│   └── telegram_alert.py
+│   ├── telegram_alert.py
+│   └── affiliate/              # MỚI v2.0
+│       ├── __init__.py
+│       ├── scanner.py          # Crawl TikTok Affiliate Marketplace
+│       ├── downloader.py       # Download video mẫu
+│       ├── editor.py           # ffmpeg + Pillow edit video
+│       └── uploader.py         # Post video + link affiliate
 ├── web/
 │   ├── api.py
-│   └── templates/index.html
+│   ├── templates/index.html
+│   └── static/
+│       ├── css/dashboard.css
+│       └── js/dashboard.js
 ├── docker/
 │   └── postgres/init/
-├── docker-compose.yml          # postgres + redis
+├── docker-compose.yml
 ├── data/
 ├── content/
 ├── profiles/
@@ -183,9 +216,18 @@ warmup:
 
 accounts:
   yaml_path: "config/accounts.yaml"
+  real_account_ids: [1, 2, 3]     # MỚI: account thật dùng TikTok Shop Affiliate
 
 content:
   default_affiliate_link: ""
+
+affiliate:                         # MỚI v2.0
+  commission_min_pct: 10          # Lọc SP có commission >= 10%
+  trending_refresh_hours: 6       # Quét lại SP trending mỗi 6h
+  video_output_dir: "data/videos/"
+  real_account_post_schedule:     # Lịch riêng cho account Real
+    posts_per_day: 2
+    time_slots: [["19:00", "22:00"]]  # Giờ vàng
 
 scheduler:
   posts_per_day: 3
@@ -223,6 +265,11 @@ main.py
 │   └── redis jobstore (optional)
 ├── browser_manager.py → Camoufox | Chromium
 ├── health_monitor.py
+├── affiliate/  (MỚI)
+│   ├── scanner.py → web scraping
+│   ├── downloader.py → yt-dlp/requests
+│   ├── editor.py → ffmpeg, Pillow
+│   └── uploader.py → post_engine
 └── web/api.py
 ```
 
@@ -241,13 +288,19 @@ main.py
 | 7 | Scheduler + Redis optional | ✅ |
 | 8 | Health Monitor + Telegram | ✅ login check dùng profile link |
 | 9 | Dashboard API + UI | ✅ |
-| 10 | Warm-up 7 ngày orchestration | ✅ |
-| 11 | Test full flow 1 account | ✅ test pass (scroll, watch, like 1/3) |
+| 10 | Settings API (ms_token) | ✅ |
+| 11 | Warm-up 7 ngày orchestration | ✅ |
 | 12 | Posting thực tế | ❌ chưa test |
+| **MỚI** | | |
+| 13 | Scanner SP Trending | ❌ chưa làm |
+| 14 | Downloader video mẫu | ❌ chưa làm |
+| 15 | Video Editor (ffmpeg) | ❌ chưa làm |
+| 16 | Upload video + link affiliate | ❌ chưa làm |
+| 17 | Lịch post riêng Real vs Farm | ❌ chưa làm |
 
 ---
 
-## VIII. Trạng thái implementation (v1.1)
+## VIII. Trạng thái implementation (v2.0)
 
 ### ✅ Hoàn thiện
 - PostgreSQL + SQLite abstraction
@@ -259,37 +312,73 @@ main.py
 - Alerts API filter resolved
 - `tiktok_post_id` lưu sau upload
 - Health: banned detection
+- Dashboard: Settings tab (ms_token config)
+- Loading spinners + toast indicators
+
+### 🔧 Đang xây dựng
+- PostEngine: upload video (mp4) thay vì slideshow ảnh
+- Affiliate Scanner: crawl TikTok Shop Marketplace
+- Video Downloader: yt-dlp integration
+- Video Editor: ffmpeg + Pillow
+- Uploader: post video + link affiliate
+- Scheduler: lịch riêng Real vs Farm
 
 ### ⚠️ Cần verify trên TikTok production
 - DOM selectors (login, upload, farm actions)
 - Camoufox anti-detect hiệu quả
 - Hashtag shadowban detection accuracy
 - CAPTCHA / 2FA flows
+- Upload video (mp4) hoạt động
 
-### ⚠️ TikTok profile lookup (tùy chọn)
-- Thư viện: **TikTokApi** (`pip install TikTokApi`) — unofficial, chỉ đọc dữ liệu public
-- Không thay thế login/upload (vẫn dùng Playwright `post_engine`)
-- `msToken` hết hạn / TikTok chặn bot → cần refresh token
-
-### ❌ Chưa làm / ngoài scope v1.1
+### ❌ Chưa làm / ngoài scope v2.0
 - React dashboard (dùng HTML + Chart.js)
 - WebSocket real-time
 - E2E automated test suite
-- TikTok Shop API integration
+- TikTok Shop API chính thức (đang chờ approve)
 
 ---
 
-## IX. Quy tắc coding
+## IX. Affiliate Pipeline Flow (MỚI v2.0)
+
+```
+1. Scanner SP Trending
+   └── Crawl TikTok Affiliate Marketplace
+       └── Lọc: commission >= 10%, doanh số cao, niche phù hợp
+           └── Output: JSON {sp_id, name, price, commission%, video_urls[]}
+
+2. Download Video Mẫu
+   └── yt-dlp / requests
+       └── Lưu: data/videos/{sp_id}/raw/
+
+3. Edit Video
+   └── ffmpeg: cắt clip ngắn (15-60s), ghép cảnh, nhạc nền
+   └── Pillow: text overlay (giá, link), QR code
+       └── Output: data/videos/{sp_id}/final/
+
+4. Upload + Link Affiliate
+   └── PostEngine (Playwright)
+       └── Đăng lên TikTok: video + caption + hashtag
+           └── Link affiliate ở bio hoặc comment đầu
+
+5. Schedule
+   └── Account Real: 1-2 video/ngày, giờ vàng 19-22h
+   └── Account Farm: tương tác với video Real
+```
+
+---
+
+## X. Quy tắc coding
 
 1. **Async-first** — asyncio cho I/O
 2. **Error handling** — try/except + log, không crash app
 3. **Graceful cleanup** — đóng browser khi shutdown
 4. **Config-driven** — paths và timing từ `settings.yaml`
 5. **Thread safety** — per-account lock, không share browser context giữa coroutines
+6. **Video processing** — dùng subprocess ffmpeg, không blocking event loop
 
 ---
 
-## X. Chạy nhanh
+## XI. Chạy nhanh
 
 ```bash
 docker compose up -d
