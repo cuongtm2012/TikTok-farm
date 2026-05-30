@@ -1166,3 +1166,66 @@ tr:hover td { background: rgba(255, 255, 255, 0.02); }
   .kpi { grid-column: span 12; }
   .header-subtitle { display: none; }
 }
+
+/* Settings panel */
+.settings-card {
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  margin-bottom: 1rem;
+}
+.settings-card h4 {
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin: 0 0 0.5rem 0;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.settings-card .status-dot-sm {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 0.35rem;
+}
+.settings-card .status-dot-sm.ok { background: var(--success); }
+.settings-card .status-dot-sm.err { background: var(--danger); }
+.settings-card .status-dot-sm.warn { background: var(--warning); }
+.settings-card .field-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-end;
+  margin-top: 0.75rem;
+}
+.settings-card .field-row input {
+  flex: 1;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.04);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+.settings-card .field-row input:focus {
+  outline: none;
+  border-color: var(--accent-2);
+}
+.settings-card .field-row input::placeholder {
+  color: var(--text-dim);
+}
+.settings-card .status-line {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: 0.5rem;
+}
+.settings-card .status-line code {
+  font-family: var(--font-mono);
+  color: var(--accent-2);
+  background: rgba(37, 244, 238, 0.1);
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+}

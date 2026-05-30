@@ -2,6 +2,7 @@
 # FastAPI routes for dashboard and management
 
 import logging
+import os
 from typing import Optional, List
 from pathlib import Path
 
@@ -699,6 +700,89 @@ async def resolve_alert(request: Request, alert_id: int):
         logger.error(f"Error resolving alert {alert_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ---- TikTok API Settings ----
+
+SETTINGS_FILE = Path(__file__).parent.parent / "config" / "settings.yaml"
+
+@router.get("/settings/tiktok-api")
+async def get_tiktok_api_settings(request: Request):
+    """Get current TikTok API configuration."""
+    state = get_state(request)
+    svc_status = state.tiktok_profile.status()
+    return {
+        "success": True,
+        "settings": {
+            "ms_token": bool(os.environ.get("TIKTOK_MS_TOKEN", "")),
+            "browser": os.environ.get("TIKTOK_BROWSER", "chromium"),
+            "installed": svc_status.get("installed", False),
+            "ready": svc_status.get("ready", False),
+        }
+    }
+
+@router.post("/settings/tiktok-api/token")
+async def set_tiktok_ms_token(request: Request, data: dict = Body(...)):
+    """Save TIKTOK_MS_TOKEN to environment and settings file."""
+    ms_token = data.get("ms_token", "").strip()
+    if not ms_token:
+        raise HTTPException(status_code=400, detail="ms_token is required")
+    if len(ms_token) < 20:
+        raise HTTPException(status_code=400, detail="ms_token looks invalid (too short)")
+
+    try:
+        # Write to .env file in config dir
+        env_path = Path(__file__).parent.parent / "config" / ".env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(env_path, "w") as f:
+            f.write(f"TIKTOK_MS_TOKEN={ms_token}\n")
+            f.write(f"TIKTOK_BROWSER={data.get('browser', 'chromium')}\n")
+
+        # Also set in running process
+        os.environ["TIKTOK_MS_TOKEN"] = ms_token
+
+        # Reinitialize the profile service
+        state = get_state(request)
+        state.tiktok_profile.ms_token = ms_token
+        state.tiktok_profile._ready = True
+
+        return {"success": True, "message": "ms_token saved successfully. Restart container for full effect."}
+    except Exception as e:
+        logger.error(f"Failed to save ms_token: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/settings/tiktok-api/test")
+async def test_tiktok_api_connection(request: Request):
+    """Test TikTok API connection by creating a session."""
+    state = get_state(request)
+    svc = state.tiktok_profile
+    status = svc.status()
+
+    if not status["installed"]:
+        return {"success": False, "message": "TikTokApi is not installed"}
+    if not status["configured"]:
+        return {"success": False, "message": "TIKTOK_MS_TOKEN is not set"}
+
+    try:
+        # Try to create session and fetch a known profile
+        profile = await svc.fetch_profile("tiktok")
+        if profile and profile.get("username"):
+            return {
+                "success": True,
+                "message": f"Connected! @{profile['username']} - {profile.get('followers', 0)} followers",
+                "profile": profile,
+            }
+        return {"success": False, "message": "Could not verify connection"}
+    except Exception as e:
+        error_msg = str(e)
+        if "timeout" in error_msg.lower():
+            return {"success": False, "message": "Connection timeout - server IP may be blocked by TikTok"}
+        return {"success": False, "message": f"Connection failed: {error_msg[:200]}"}
+
+@router.get("/settings/tiktok-api/status")
+async def get_tiktok_api_status(request: Request):
+    """Get detailed TikTok API status."""
+    state = get_state(request)
+    return {"success": True, "status": state.tiktok_profile.status()}
 
 # ---- Dashboard HTML ----
 

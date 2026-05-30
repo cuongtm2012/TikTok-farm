@@ -137,6 +137,7 @@ async function refreshAll() {
       refreshAccounts(),
       refreshProxies(),
       refreshAlerts(),
+      refreshSettings(),
     ]);
     updateLastSync();
   } catch (e) {
@@ -808,6 +809,100 @@ function escapeHtml(str) {
   return d.innerHTML;
 }
 
+// ---- Settings ----
+
+async function refreshSettings() {
+  const wrap = document.getElementById("settingsPanel");
+  if (!wrap) return;
+  try {
+    const r = await API.get("/api/settings/tiktok-api");
+    if (!r.success) {
+      wrap.innerHTML = `<div class="empty-state">Failed to load settings</div>`;
+      return;
+    }
+    const s = r.settings;
+    wrap.innerHTML = `
+      <div class="settings-card">
+        <h4><i data-lucide="radio" style="width:16px;height:16px"></i> TikTok API</h4>
+        <div class="status-line">
+          Status: ${s.ready ? '<span class="status-dot-sm ok"></span>Ready' : s.installed ? '<span class="status-dot-sm warn"></span>Not configured' : '<span class="status-dot-sm err"></span>TikTokApi not installed'}
+        </div>
+        <div class="status-line">
+          Library: ${s.installed ? '<code>installed</code>' : '<code>not installed</code>'}
+          ${s.ms_token ? '&middot; <code>ms_token set</code>' : '&middot; <code>no ms_token</code>'}
+          ${s.browser ? '&middot; Browser: ' + s.browser : ''}
+        </div>
+        <div class="field-row">
+          <input id="settingsMsToken" type="password" placeholder="Paste ms_token here" value="${s.ms_token ? '********' : ''}">
+          <button class="btn btn-sm" type="button" id="btnSaveToken">Save</button>
+          <button class="btn btn-sm" type="button" id="btnTestApi">Test</button>
+        </div>
+        <div id="settingsResult" style="margin-top:0.5rem"></div>
+      </div>
+      <div class="settings-card">
+        <h4><i data-lucide="info" style="width:16px;height:16px"></i> How to get ms_token</h4>
+        <div style="font-size:0.8rem;color:var(--text-muted);line-height:1.6">
+          1. Log into TikTok on Chrome/Firefox<br>
+          2. Open DevTools (F12) &rarr; Application tab &rarr; Cookies &rarr; tiktok.com<br>
+          3. Find <code>ms_token</code>, copy its value<br>
+          4. Paste above and click Save, then Test
+        </div>
+      </div>`;
+
+    if (typeof lucide !== "undefined") lucide.createIcons();
+
+    document.getElementById("btnSaveToken")?.addEventListener("click", saveMsToken);
+    document.getElementById("btnTestApi")?.addEventListener("click", testTikTokApi);
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function saveMsToken() {
+  const input = document.getElementById("settingsMsToken");
+  const token = input?.value?.trim();
+  const result = document.getElementById("settingsResult");
+  if (!token || token === "********") {
+    result.innerHTML = '<span style="color:var(--warning)">Paste the ms_token value first</span>';
+    return;
+  }
+  const btn = document.getElementById("btnSaveToken");
+  setButtonLoading(btn, true);
+  try {
+    const r = await API.postJson("/api/settings/tiktok-api/token", { ms_token: token });
+    result.innerHTML = `<span style="color:var(--success)">${escapeHtml(r.message)}</span>`;
+    toast(r.message);
+    refreshSettings();
+  } catch (e) {
+    result.innerHTML = `<span style="color:var(--danger)">${escapeHtml(e.message)}</span>`;
+    toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
+  }
+}
+
+async function testTikTokApi() {
+  const result = document.getElementById("settingsResult");
+  result.innerHTML = '<span style="color:var(--text-muted)">Testing connection...</span>';
+  const btn = document.getElementById("btnTestApi");
+  setButtonLoading(btn, true);
+  try {
+    const r = await API.post("/api/settings/tiktok-api/test");
+    if (r.success) {
+      result.innerHTML = `<span style="color:var(--success)">${escapeHtml(r.message)}</span>`;
+      toast("TikTok API connected");
+    } else {
+      result.innerHTML = `<span style="color:var(--warning)">${escapeHtml(r.message)}</span>`;
+      toast(r.message, "error");
+    }
+  } catch (e) {
+    result.innerHTML = `<span style="color:var(--danger)">${escapeHtml(e.message)}</span>`;
+    toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
+  }
+}
+
 function updateNavBadges({ accounts, proxies, alerts }) {
   const set = (id, n) => {
     const el = document.getElementById(id);
@@ -867,7 +962,7 @@ function initNav() {
     }
   });
 
-  const sections = ["overview", "accounts", "proxies", "alerts"];
+  const sections = ["overview", "accounts", "proxies", "alerts", "settings"];
   const observer = new IntersectionObserver(
     (entries) => {
       const visible = entries
