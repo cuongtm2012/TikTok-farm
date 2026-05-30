@@ -131,8 +131,8 @@ class TikTokProfileService:
         async with TikTokApi() as api:
             await api.create_sessions(
                 ms_tokens=[self.ms_token],
-                num_sessions=1,
-                sleep_after=3,
+                num_sessions=2,
+                sleep_after=8,
                 browser=self.browser,
             )
             user = api.user(username)

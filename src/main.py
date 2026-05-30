@@ -138,6 +138,24 @@ class AppState:
             tick = self.warmup_manager.run_daily_tick()
             logger.info(f"Warm-up on startup: {tick}")
 
+        # Warm up TikTok API sessions
+        try:
+            if self.tiktok_profile and self.tiktok_profile.is_ready():
+                logger.info("Warming up TikTok API sessions...")
+                from TikTokApi import TikTokApi
+                api = TikTokApi()
+                await api.create_sessions(
+                    ms_tokens=[self.tiktok_profile.ms_token],
+                    num_sessions=2,
+                    sleep_after=8,
+                    browser=self.tiktok_profile.browser,
+                )
+                await api.close_sessions()
+                await api.stop_playwright()
+                logger.info("TikTok sessions warmed up on startup")
+        except Exception as e:
+            logger.warning(f"TikTok session warmup failed (non-fatal): {e}")
+
         self.scheduler.start()
 
         # Send startup notification

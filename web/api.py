@@ -646,6 +646,7 @@ async def sync_profile(request: Request, account_id: int):
             "followers": profile.get("followers", 0),
             "following": profile.get("following", 0),
             "total_posts": profile.get("video_count", 0),
+            "status": "active",
         }
         state.account_manager.update_account(account_id, **updates)
         return {"success": True, "profile": profile, "updates": updates}
