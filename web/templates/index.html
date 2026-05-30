@@ -1,331 +1,139 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TikTok Farm Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f0f; color: #e0e0e0; }
-        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
-        header { background: linear-gradient(135deg, #ff004f, #ff6b9d); padding: 20px 30px; border-radius: 12px; margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center; }
-        header h1 { font-size: 28px; color: white; }
-        header .status { background: rgba(255,255,255,0.2); padding: 8px 16px; border-radius: 20px; font-size: 14px; color: white; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }
-        .card { background: #1a1a1a; border-radius: 12px; padding: 20px; border: 1px solid #2a2a2a; }
-        .card h3 { font-size: 14px; color: #888; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-        .card .value { font-size: 36px; font-weight: bold; color: #fff; }
-        .card .subtext { font-size: 13px; color: #666; margin-top: 4px; }
-        .card.danger .value { color: #ff4444; }
-        .card.warning .value { color: #ffaa00; }
-        .card.success .value { color: #44ff44; }
-        .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
-        .chart-container { background: #1a1a1a; border-radius: 12px; padding: 20px; border: 1px solid #2a2a2a; }
-        .chart-container canvas { max-height: 300px; }
-        .section { margin-bottom: 24px; }
-        .section h2 { font-size: 20px; margin-bottom: 16px; color: #ccc; }
-        table { width: 100%; border-collapse: collapse; background: #1a1a1a; border-radius: 12px; overflow: hidden; border: 1px solid #2a2a2a; }
-        th { background: #2a2a2a; padding: 12px 16px; text-align: left; font-size: 13px; color: #888; text-transform: uppercase; letter-spacing: 1px; }
-        td { padding: 12px 16px; border-top: 1px solid #2a2a2a; font-size: 14px; }
-        .status-badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
-        .status-active { background: #1a3a1a; color: #44ff44; }
-        .status-warming { background: #1a2a3a; color: #44aaff; }
-        .status-pending { background: #2a2a1a; color: #ffaa00; }
-        .status-banned { background: #3a1a1a; color: #ff4444; }
-        .status-shadowbanned { background: #3a2a1a; color: #ff6644; }
-        .status-paused { background: #2a2a2a; color: #888; }
-        .refresh-btn { background: #ff004f; color: white; border: none; padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; }
-        .refresh-btn:hover { background: #cc0040; }
-        .loading { text-align: center; padding: 40px; color: #666; }
-        .alerts-list { max-height: 300px; overflow-y: auto; }
-        .alert-item { padding: 10px 16px; border-left: 3px solid #ff004f; margin-bottom: 8px; background: #1a1a1a; border-radius: 0 8px 8px 0; font-size: 13px; }
-        .alert-item .time { color: #666; font-size: 11px; margin-top: 4px; }
-        @media (max-width: 768px) {
-            .charts { grid-template-columns: 1fr; }
-            .grid { grid-template-columns: 1fr 1fr; }
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="TikTok Farm — automated account operations dashboard">
+  <title>TikTok Farm · Control Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/lucide@0.294.0/dist/umd/lucide.min.js"></script>
+  <link rel="stylesheet" href="/static/css/dashboard.css">
 </head>
 <body>
-    <div class="container">
-        <header>
-            <div>
-                <h1>🎬 TikTok Farm</h1>
-                <div style="font-size: 13px; color: rgba(255,255,255,0.8); margin-top: 4px;">Automated Account Management System</div>
-            </div>
-            <div style="display: flex; align-items: center; gap: 12px;">
-                <span class="status" id="headerStatus">● Loading...</span>
-                <button class="refresh-btn" onclick="refreshAll()">↻ Refresh</button>
-            </div>
-        </header>
-
-        <!-- Stats Cards -->
-        <div class="grid" id="statsCards">
-            <div class="card loading">Loading stats...</div>
+  <div class="app">
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+      <div class="brand">
+        <div class="brand-icon" aria-hidden="true">
+          <i data-lucide="radio" style="width:22px;height:22px;color:#fff"></i>
         </div>
-
-        <!-- Charts -->
-        <div class="charts">
-            <div class="chart-container">
-                <h3 style="margin-bottom: 12px; color: #888;">Account Status Distribution</h3>
-                <canvas id="statusChart"></canvas>
-            </div>
-            <div class="chart-container">
-                <h3 style="margin-bottom: 12px; color: #888;">Performance Overview</h3>
-                <canvas id="performanceChart"></canvas>
-            </div>
+        <div>
+          <h1>TikTok Farm</h1>
+          <span>Control Center</span>
         </div>
+      </div>
 
-        <!-- Accounts Table -->
-        <div class="section">
-            <h2>📋 Accounts</h2>
-            <div id="accountsTable"><div class="loading">Loading accounts...</div></div>
+      <nav>
+        <ul class="nav">
+          <li><a href="#overview" class="active" data-section="overview"><i data-lucide="layout-dashboard"></i> Overview</a></li>
+          <li><a href="#accounts" data-section="accounts"><i data-lucide="users"></i> Accounts</a></li>
+          <li><a href="#proxies" data-section="proxies"><i data-lucide="globe"></i> Proxies</a></li>
+          <li><a href="#alerts" data-section="alerts"><i data-lucide="bell"></i> Alerts</a></li>
+        </ul>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div id="schedulerStatus">Scheduler: —</div>
+        <div class="status-pill ok" id="systemStatus">
+          <span class="status-dot"></span> Loading…
         </div>
+        <div style="margin-top:0.75rem">Sync: <span id="lastSync">—</span></div>
+      </div>
+    </aside>
 
-        <!-- Alerts -->
-        <div class="section">
-            <h2>🔔 Recent Alerts</h2>
-            <div class="card" id="alertsSection">
-                <div class="loading">Loading alerts...</div>
-            </div>
+    <main class="main">
+      <header class="topbar" id="overview">
+        <div class="topbar-intro">
+          <button class="btn btn-icon menu-toggle" id="menuToggle" type="button" aria-label="Open menu">
+            <i data-lucide="menu"></i>
+          </button>
+          <div>
+            <h2>Operations overview</h2>
+            <p>Monitor accounts, proxies, and farm automation in real time</p>
+          </div>
         </div>
-    </div>
+        <div class="topbar-actions">
+          <button class="btn" type="button" id="btnProxyCheck" title="Check all proxies">
+            <i data-lucide="wifi"></i> Proxies
+          </button>
+          <button class="btn" type="button" id="btnReschedule" title="Reschedule all jobs">
+            <i data-lucide="calendar-clock"></i> Reschedule
+          </button>
+          <button class="btn btn-primary" type="button" id="btnRefresh">
+            <i data-lucide="refresh-cw"></i> Refresh
+          </button>
+        </div>
+      </header>
 
-    <script>
-        let statusChart = null;
-        let performanceChart = null;
+      <section class="bento" id="bentoKpis" aria-label="Key metrics">
+        <article class="kpi"><div class="skeleton" style="height:4rem"></div></article>
+        <article class="kpi"><div class="skeleton" style="height:4rem"></div></article>
+        <article class="kpi"><div class="skeleton" style="height:4rem"></div></article>
+        <article class="kpi"><div class="skeleton" style="height:4rem"></div></article>
+      </section>
 
-        async function fetchAPI(endpoint) {
-            try {
-                const res = await fetch(endpoint);
-                const data = await res.json();
-                return data;
-            } catch (err) {
-                console.error('API error:', err);
-                return { success: false, error: err.message };
-            }
-        }
+      <section class="charts-row" aria-label="Charts">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Account status</h3>
+            <span>Distribution</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="statusChart" role="img" aria-label="Account status chart"></canvas>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Engagement metrics</h3>
+            <span>All posted content</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="performanceChart" role="img" aria-label="Performance chart"></canvas>
+          </div>
+        </div>
+      </section>
 
-        async function refreshAll() {
-            await Promise.all([
-                refreshStats(),
-                refreshAccounts(),
-                refreshAlerts(),
-                refreshCharts(),
-            ]);
-        }
+      <section class="section" id="accounts">
+        <h2 class="section-title">
+          <i data-lucide="users" style="width:20px;height:20px"></i>
+          Accounts
+        </h2>
+        <div class="table-wrap" id="accountsTable">
+          <div class="empty-state">Loading accounts…</div>
+        </div>
+      </section>
 
-        async function refreshStats() {
-            const health = await fetchAPI('/api/health');
-            const perf = await fetchAPI('/api/performance');
+      <section class="section" id="proxies">
+        <h2 class="section-title">
+          <i data-lucide="globe" style="width:20px;height:20px"></i>
+          Proxy pool
+        </h2>
+        <div class="table-wrap" id="proxiesTable">
+          <div class="empty-state">Loading proxies…</div>
+        </div>
+      </section>
 
-            if (!health.success || !perf.success) {
-                document.getElementById('statsCards').innerHTML = '<div class="card">Failed to load stats</div>';
-                return;
-            }
+      <section class="section" id="alerts">
+        <h2 class="section-title">
+          <i data-lucide="bell" style="width:20px;height:20px"></i>
+          Active alerts
+        </h2>
+        <div class="panel" id="alertsList">
+          <div class="empty-state">Loading alerts…</div>
+        </div>
+      </section>
+    </main>
+  </div>
 
-            const h = health.health;
-            const s = perf.stats;
+  <div class="toast-container" id="toastContainer" aria-live="polite"></div>
 
-            // Update header status
-            const statusEl = document.getElementById('headerStatus');
-            const issues = h.recent_alerts ? h.recent_alerts.length : 0;
-            statusEl.textContent = issues > 0 ? `● ${issues} alerts` : '● All good';
-            statusEl.style.background = issues > 0 ? 'rgba(255,68,68,0.3)' : 'rgba(68,255,68,0.2)';
-
-            const cards = [
-                { title: 'Total Accounts', value: h.total_accounts || 0, sub: `${h.account_statuses?.active || 0} active`, cls: '' },
-                { title: 'Posts Published', value: s.posts_posted || 0, sub: `${s.total_views || 0} total views`, cls: 'success' },
-                { title: 'Avg Engagement', value: (s.avg_engagement_per_post || 0).toFixed(1), sub: 'per post (likes+comments+shares)', cls: 'success' },
-                { title: 'Flagged Accounts', value: h.account_statuses?.banned || 0 + (h.account_statuses?.shadowbanned || 0), sub: 'banned / shadowbanned', cls: h.account_statuses?.banned > 0 ? 'danger' : '' },
-                { title: 'Active Proxies', value: h.proxy_statuses?.active || 0, sub: `${h.total_proxies || 0} total`, cls: '' },
-                { title: 'Unresolved Alerts', value: s.unresolved_alerts || 0, sub: 'needs attention', cls: (s.unresolved_alerts || 0) > 0 ? 'warning' : '' },
-            ];
-
-            document.getElementById('statsCards').innerHTML = cards.map(c => `
-                <div class="card ${c.cls}">
-                    <h3>${c.title}</h3>
-                    <div class="value">${c.value}</div>
-                    <div class="subtext">${c.sub}</div>
-                </div>
-            `).join('');
-        }
-
-        async function refreshAccounts() {
-            const data = await fetchAPI('/api/accounts');
-            if (!data.success) {
-                document.getElementById('accountsTable').innerHTML = '<div class="loading">Failed to load accounts</div>';
-                return;
-            }
-
-            const accounts = data.accounts || [];
-
-            if (accounts.length === 0) {
-                document.getElementById('accountsTable').innerHTML = '<div class="card">No accounts yet. Add one via the API.</div>';
-                return;
-            }
-
-            const statusColors = {
-                'active': 'status-active',
-                'warming': 'status-warming',
-                'pending': 'status-pending',
-                'banned': 'status-banned',
-                'shadowbanned': 'status-shadowbanned',
-                'paused': 'status-paused',
-            };
-
-            let html = `<table>
-                <thead><tr>
-                    <th>ID</th>
-                    <th>Username</th>
-                    <th>Status</th>
-                    <th>Followers</th>
-                    <th>Posts</th>
-                    <th>Views</th>
-                    <th>Last Active</th>
-                    <th>Created</th>
-                </tr></thead><tbody>`;
-
-            accounts.forEach(a => {
-                const statusClass = statusColors[a.status] || 'status-pending';
-                const lastActive = a.last_active ? new Date(a.last_active).toLocaleDateString() : '-';
-                const created = a.created_at ? new Date(a.created_at).toLocaleDateString() : '-';
-                html += `<tr>
-                    <td>${a.id}</td>
-                    <td><strong>@${a.username}</strong></td>
-                    <td><span class="status-badge ${statusClass}">${a.status}</span></td>
-                    <td>${a.followers || 0}</td>
-                    <td>${a.total_posts || 0}</td>
-                    <td>${a.total_views || 0}</td>
-                    <td>${lastActive}</td>
-                    <td>${created}</td>
-                </tr>`;
-            });
-
-            html += '</tbody></table>';
-            document.getElementById('accountsTable').innerHTML = html;
-        }
-
-        async function refreshAlerts() {
-            const data = await fetchAPI('/api/alerts');
-            if (!data.success) {
-                document.getElementById('alertsSection').innerHTML = '<div class="loading">Failed to load alerts</div>';
-                return;
-            }
-
-            const alerts = data.alerts || [];
-
-            if (alerts.length === 0) {
-                document.getElementById('alertsSection').innerHTML = '<div style="padding: 20px; color: #666;">No unresolved alerts. All clear! ✅</div>';
-                return;
-            }
-
-            const icons = {
-                'shadowban': '🚫',
-                'rate_limit': '⚠️',
-                'banned': '🔴',
-                'login_fail': '❌',
-            };
-
-            const html = `<div class="alerts-list">
-                ${alerts.map(a => `
-                    <div class="alert-item">
-                        <strong>${icons[a.alert_type] || '🔔'} ${a.alert_type}</strong>
-                        <div>${a.message}</div>
-                        <div class="time">${a.created_at ? new Date(a.created_at).toLocaleString() : ''} ${a.username ? '· @' + a.username : ''}</div>
-                    </div>
-                `).join('')}
-            </div>`;
-
-            document.getElementById('alertsSection').innerHTML = html;
-        }
-
-        async function refreshCharts() {
-            const health = await fetchAPI('/api/health');
-            const perf = await fetchAPI('/api/performance');
-
-            if (!health.success || !perf.success) return;
-
-            const h = health.health;
-            const s = perf.stats;
-
-            // Status distribution chart
-            const statusCtx = document.getElementById('statusChart').getContext('2d');
-            const statuses = h.account_statuses || {};
-            const labels = Object.keys(statuses);
-            const values = Object.values(statuses);
-
-            if (statusChart) statusChart.destroy();
-
-            const colors = {
-                active: '#44ff44',
-                warming: '#44aaff',
-                pending: '#ffaa00',
-                banned: '#ff4444',
-                shadowbanned: '#ff6644',
-                paused: '#888888',
-            };
-
-            statusChart = new Chart(statusCtx, {
-                type: 'doughnut',
-                data: {
-                    labels: labels.map(l => l.charAt(0).toUpperCase() + l.slice(1)),
-                    datasets: [{
-                        data: values,
-                        backgroundColor: labels.map(l => colors[l] || '#666'),
-                        borderWidth: 2,
-                        borderColor: '#1a1a1a',
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    plugins: {
-                        legend: {
-                            position: 'bottom',
-                            labels: { color: '#ccc', padding: 16 }
-                        }
-                    }
-                }
-            });
-
-            // Performance chart
-            const perfCtx = document.getElementById('performanceChart').getContext('2d');
-
-            performanceChart = new Chart(perfCtx, {
-                type: 'bar',
-                data: {
-                    labels: ['Views', 'Likes', 'Comments', 'Shares'],
-                    datasets: [{
-                        label: 'Total',
-                        data: [s.total_views || 0, s.total_likes || 0, s.total_comments || 0, s.total_shares || 0],
-                        backgroundColor: ['#44aaff', '#44ff44', '#ffaa00', '#ff004f'],
-                        borderRadius: 6,
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    plugins: {
-                        legend: { display: false }
-                    },
-                    scales: {
-                        y: {
-                            beginAtZero: true,
-                            ticks: { color: '#666' },
-                            grid: { color: '#2a2a2a' }
-                        },
-                        x: {
-                            ticks: { color: '#ccc' },
-                            grid: { display: false }
-                        }
-                    }
-                }
-            });
-        }
-
-        // Auto refresh every 60 seconds
-        refreshAll();
-        setInterval(refreshAll, 60000);
-    </script>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      if (typeof lucide !== "undefined") lucide.createIcons();
+    });
+  </script>
+  <script src="/static/js/dashboard.js"></script>
 </body>
 </html>
