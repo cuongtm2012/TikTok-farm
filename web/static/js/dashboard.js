@@ -687,7 +687,7 @@ async function lookupTikTokProfile() {
 async function syncAccountProfile(accountId) {
   try {
     toast("Syncing TikTok profile…");
-    const r = await API.post(`/api/accounts/${accountId}/sync-profile`);
+    const r = await API.post(`/api/actions/sync-profile/${accountId}`);
     toast(`@${r.profile?.username || accountId}: ${formatNum(r.profile?.followers)} followers`);
     refreshAccounts();
     refreshStats();
@@ -1015,6 +1015,26 @@ function initModals() {
   document.getElementById("btnSubmitProxy")?.addEventListener("click", submitProxyModal);
   document.getElementById("btnLookupProfile")?.addEventListener("click", lookupTikTokProfile);
   document.getElementById("btnSyncAllProfiles")?.addEventListener("click", syncAllAccountProfiles);
+
+  // Action buttons (Farm, Post, Sync, Check, Del) — event delegation
+  document.getElementById("accountsBody")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-action]");
+    if (!btn) return;
+    e.preventDefault();
+    const action = btn.dataset.action;
+    const id = parseInt(btn.dataset.id);
+    if (action === "delete") {
+      deleteAccount(id);
+    } else {
+      runAction(action, id);
+    }
+  });
+  document.getElementById("accountsBody")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-delete-proxy]");
+    if (!btn) return;
+    e.preventDefault();
+    deleteProxy(parseInt(btn.dataset.deleteProxy));
+  });
 
   document.querySelectorAll("[data-close]").forEach((btn) => {
     btn.addEventListener("click", () => closeModal(btn.dataset.close));
