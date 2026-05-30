@@ -614,6 +614,48 @@ async def trigger_post(request: Request, account_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/profile/status")
+async def profile_service_status(request: Request):
+    """Check if TikTok profile sync is ready."""
+    state = get_state(request)
+    return {"success": True, "status": state.tiktok_profile.status()}
+
+
+@router.post("/actions/sync-profile/{account_id}")
+async def sync_profile(request: Request, account_id: int):
+    """Manually trigger TikTok profile sync for an account."""
+    state = get_state(request)
+    try:
+        account = state.account_manager.get_account(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+
+        svc = state.tiktok_profile
+        status = svc.status()
+        if not status["ready"]:
+            issues = []
+            if not status["installed"]:
+                issues.append("TikTokApi not installed")
+            if not status["configured"]:
+                issues.append("TIKTOK_MS_TOKEN not set")
+            msg = "Profile sync not ready: " + "; ".join(issues)
+            raise HTTPException(status_code=400, detail=msg)
+
+        profile = await svc.fetch_profile(account.username)
+        updates = {
+            "followers": profile.get("followers", 0),
+            "following": profile.get("following", 0),
+            "total_posts": profile.get("video_count", 0),
+        }
+        state.account_manager.update_account(account_id, **updates)
+        return {"success": True, "profile": profile, "updates": updates}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Profile sync error for {account_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/actions/check/{account_id}")
 async def trigger_check(request: Request, account_id: int):
     """Trigger a health check for an account."""

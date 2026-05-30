@@ -28,6 +28,9 @@ tenacity>=8.2.0
 # Camoufox (anti-detect browser) — optional, enable in settings camoufox.use_camoufox
 # camoufox>=0.4.0
 
+# TikTok profile sync — public profile lookup
+TikTokApi>=6.3.0
+
 # Redis (APScheduler job store when redis.enabled=true)
 redis>=5.0.0
 

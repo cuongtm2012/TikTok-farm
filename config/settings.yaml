@@ -51,7 +51,7 @@ accounts:
 # Public profile stats via https://github.com/davidteather/TikTok-Api
 tiktok_profile:
   enabled: true
-  ms_token: ""          # or env TIKTOK_MS_TOKEN (msToken cookie from tiktok.com)
+  ms_token: "8mLW9QGWCGpaA_TG6Rkw6iAYD9sY0vUvLOGtYIRs8eCLusG6Njlbu4vr5ZIP6GvvQTPR4zJjgVSceNwpwZvTlu7LIzJVqEMkzWKCtaMzVGAYmMUGQaPer848FAth9Xp_rCVBgdzuS1Semg=="
   browser: chromium     # chromium | firefox | webkit
 
 content:
