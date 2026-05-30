@@ -58,8 +58,10 @@ class PostEngine:
 
             # Check if we're logged in by looking for user avatar or profile element
             logged_in = await page.query_selector(
+                'a[href*="/@"][class*="avatar"], '
+                'a[href*="/@"] img[alt], '
                 '[data-e2e="user-avatar"], [data-e2e="profile-icon"], '
-                '[class*="avatar"], [data-testid="user-avatar"]'
+                '[class*="avatar"]'
             )
 
             if logged_in:

@@ -162,10 +162,10 @@ class FarmEngine:
                 attempts += 1
 
                 try:
-                    # Find like buttons - TikTok uses SVG-based like buttons
+                    # Find like buttons - TikTok uses aria-label based like buttons (2026)
                     like_buttons = await page.query_selector_all(
-                        '[data-e2e="like-icon"], .css-1mh6j7c, [class*="like"] button, '
-                        'span[class*="Like"], div[data-click="like"]'
+                        'button[aria-label*="Like video"], '
+                        '[data-e2e="like-icon"]'
                     )
 
                     if not like_buttons:
@@ -177,7 +177,8 @@ class FarmEngine:
                     # Like the first available video
                     btn = like_buttons[0]
                     is_liked = await page.evaluate(
-                        "(el) => el.classList.contains('liked') || el.getAttribute('aria-pressed') === 'true'",
+                        "(el) => el.classList.contains('liked') || el.getAttribute('aria-pressed') === 'true' || "
+                        "el.getAttribute('data-is-liked') === 'true'",
                         btn,
                     )
 
@@ -239,10 +240,11 @@ class FarmEngine:
 
                 try:
                     # Click on comment section of a video
-                    # TikTok comments open in a modal/side panel
+                    # TikTok comments open in a modal/side panel (2026: aria-label based)
                     comment_triggers = await page.query_selector_all(
-                        '[data-e2e="comment-icon"], [class*="comment"] button, '
-                        'span[class*="Comment"], div[data-click="comment"]'
+                        'button[aria-label*="comments"], '
+                        'button[aria-label*="Comments"], '
+                        '[data-e2e="comment-icon"]'
                     )
 
                     if not comment_triggers:
@@ -345,9 +347,11 @@ class FarmEngine:
 
                 try:
                     # Find follow buttons on the feed
+                    # TikTok 2026: button with "Follow" text, or in profile section
                     follow_buttons = await page.query_selector_all(
-                        '[data-e2e="follow-button"], [class*="follow"] button, '
-                        'button:has-text("Follow"), div[data-click="follow"]'
+                        'button[aria-label*="Follow"], '
+                        'button:has-text("Follow"):not(:has-text("Following")), '
+                        '[data-e2e="follow-button"]'
                     )
 
                     if not follow_buttons:

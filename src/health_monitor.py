@@ -54,8 +54,10 @@ class HealthMonitor:
 
             # Check for login indicators
             logged_in_elem = await page.query_selector(
+                'a[href*="/@"][class*="avatar"], '
+                'a[href*="/@"] img[alt], '
                 '[data-e2e="user-avatar"], [class*="avatar"], '
-                '[data-testid="user-avatar"], [data-e2e="profile-icon"]'
+                '[data-e2e="profile-icon"]'
             )
 
             if logged_in_elem:

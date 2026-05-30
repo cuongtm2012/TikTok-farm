@@ -227,17 +227,17 @@ main.py
 | # | Hạng mục | Trạng thái |
 |---|----------|-----------|
 | 1 | Proxy Manager + CSV + rotate | ✅ |
-| 2 | Account Manager + DB + YAML import | ✅ |
+| 2 | Account Manager + DB + API import | ✅ (đã tắt YAML import, dùng API) |
 | 3 | Browser Manager (Camoufox optional) | ⚠️ Chromium default; bật Camoufox khi cài package |
-| 4 | Farm Engine | ✅ code; ⚠️ cần test TikTok thật |
+| 4 | Farm Engine (DOM selectors 2026) | ✅ fixed: like/comment/follow dùng aria-label |
 | 5 | Content Pipeline | ✅ |
-| 6 | Post Engine + cookie persist | ✅ code; ⚠️ cần test TikTok thật |
+| 6 | Post Engine + cookie persist | ✅ login check dùng profile link |
 | 7 | Scheduler + Redis optional | ✅ |
-| 8 | Health Monitor + Telegram | ✅ |
+| 8 | Health Monitor + Telegram | ✅ login check dùng profile link |
 | 9 | Dashboard API + UI | ✅ |
 | 10 | Warm-up 7 ngày orchestration | ✅ |
-| 11 | Test full flow 1 account | ❌ manual QA |
-| 12 | Posting thực tế | ❌ manual QA |
+| 11 | Test full flow 1 account | ✅ test pass (scroll, watch, like 1/3) |
+| 12 | Posting thực tế | ❌ chưa test |
 
 ---
 
