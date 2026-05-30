@@ -1,0 +1,27 @@
+# TikTok Farm - Server docker-compose (runs alongside swhubco)
+# Uses existing PostgreSQL port 5433 to avoid conflict
+# Web dashboard on port 8080 (not 8000 which is free)
+
+services:
+  tiktok-farm:
+    build: .
+    image: tiktok-farm:latest
+    container_name: tiktok-farm
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - farm_data:/app/data
+      - farm_logs:/app/logs
+      - farm_profiles:/app/profiles
+      - farm_content:/app/content
+      - ./config:/app/config:ro
+    environment:
+      - DATABASE_DRIVER=sqlite
+    command: ["python", "src/main.py"]
+
+volumes:
+  farm_data:
+  farm_logs:
+  farm_profiles:
+  farm_content:
