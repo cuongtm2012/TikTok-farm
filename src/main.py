@@ -120,8 +120,9 @@ class AppState:
         )
 
         self.proxy_manager.load_from_csv()
-        accounts_yaml = settings.get("accounts", {}).get("yaml_path", "config/accounts.yaml")
-        self.account_manager.load_accounts_from_yaml(accounts_yaml)
+        # Skip YAML import — use API instead
+        # accounts_yaml = settings.get("accounts", {}).get("yaml_path", "config/accounts.yaml")
+        # self.account_manager.load_accounts_from_yaml(accounts_yaml)
 
         logger.info("All components initialized")
 
@@ -214,12 +215,23 @@ async def _shutdown_handler(sig, state: AppState):
 # ---- Create FastAPI App ----
 
 if FASTAPI_AVAILABLE:
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import RedirectResponse
+
     app = FastAPI(
         title="TikTok Farm",
         description="Automated TikTok account farming and content management system",
         version="1.0.0",
         lifespan=app_lifespan,
     )
+
+    static_dir = Path(__file__).parent.parent / "web" / "static"
+    if static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    @app.get("/")
+    async def root_redirect():
+        return RedirectResponse(url="/api/dashboard")
 
     # Health endpoint
     @app.get("/health")
