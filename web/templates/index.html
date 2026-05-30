@@ -13,60 +13,130 @@
   <link rel="stylesheet" href="/static/css/dashboard.css">
 </head>
 <body>
-  <div class="app">
+  <div class="layout" id="layout">
+    <!-- Left menu -->
     <aside class="sidebar" id="sidebar" aria-label="Main navigation">
-      <div class="brand">
+      <div class="sidebar-brand">
         <div class="brand-icon" aria-hidden="true">
-          <i data-lucide="radio" style="width:22px;height:22px;color:#fff"></i>
+          <i data-lucide="radio"></i>
         </div>
-        <div>
-          <h1>TikTok Farm</h1>
-          <span>Control Center</span>
+        <div class="brand-text">
+          <span class="brand-title">TikTok Farm</span>
+          <span class="brand-sub">Control Center</span>
         </div>
+        <button type="button" class="sidebar-collapse" id="sidebarCollapse" aria-label="Collapse menu" title="Collapse">
+          <i data-lucide="panel-left-close"></i>
+        </button>
       </div>
 
-      <nav>
-        <ul class="nav">
-          <li><a href="#overview" class="active" data-section="overview"><i data-lucide="layout-dashboard"></i> Overview</a></li>
-          <li><a href="#accounts" data-section="accounts"><i data-lucide="users"></i> Accounts</a></li>
-          <li><a href="#proxies" data-section="proxies"><i data-lucide="globe"></i> Proxies</a></li>
-          <li><a href="#alerts" data-section="alerts"><i data-lucide="bell"></i> Alerts</a></li>
-        </ul>
+      <nav class="sidebar-nav">
+        <div class="nav-group">
+          <span class="nav-label">Dashboard</span>
+          <ul class="nav-list">
+            <li>
+              <a href="#overview" class="nav-link active" data-section="overview" data-title="Overview" data-subtitle="Metrics and charts">
+                <i data-lucide="layout-dashboard"></i>
+                <span class="nav-link-text">Overview</span>
+              </a>
+            </li>
+          </ul>
+        </div>
+
+        <div class="nav-group">
+          <span class="nav-label">Management</span>
+          <ul class="nav-list">
+            <li>
+              <a href="#accounts" class="nav-link" data-section="accounts" data-title="TikTok Accounts" data-subtitle="Create and import accounts">
+                <i data-lucide="users"></i>
+                <span class="nav-link-text">Accounts</span>
+                <span class="nav-badge" id="navBadgeAccounts">0</span>
+              </a>
+            </li>
+            <li>
+              <a href="#proxies" class="nav-link" data-section="proxies" data-title="Proxy Pool" data-subtitle="Proxies and health checks">
+                <i data-lucide="globe"></i>
+                <span class="nav-link-text">Proxies</span>
+                <span class="nav-badge" id="navBadgeProxies">0</span>
+              </a>
+            </li>
+            <li>
+              <a href="#alerts" class="nav-link" data-section="alerts" data-title="Alerts" data-subtitle="System notifications">
+                <i data-lucide="bell"></i>
+                <span class="nav-link-text">Alerts</span>
+                <span class="nav-badge nav-badge-warn" id="navBadgeAlerts">0</span>
+              </a>
+            </li>
+          </ul>
+        </div>
+
+        <div class="nav-group nav-group-actions">
+          <span class="nav-label">Quick actions</span>
+          <div class="nav-actions">
+            <button type="button" class="nav-action-btn" id="navAddAccount">
+              <i data-lucide="user-plus"></i><span>Add account</span>
+            </button>
+            <button type="button" class="nav-action-btn" id="navImportAccounts">
+              <i data-lucide="upload"></i><span>Import accounts</span>
+            </button>
+            <button type="button" class="nav-action-btn" id="navAddProxy">
+              <i data-lucide="plus"></i><span>Add proxy</span>
+            </button>
+          </div>
+        </div>
       </nav>
 
       <div class="sidebar-footer">
-        <div id="schedulerStatus">Scheduler: —</div>
-        <div class="status-pill ok" id="systemStatus">
-          <span class="status-dot"></span> Loading…
-        </div>
-        <div style="margin-top:0.75rem">Sync: <span id="lastSync">—</span></div>
+        <div class="sidebar-meta" id="schedulerStatus">Scheduler: —</div>
+        <div class="sidebar-meta">v1.0 · PostgreSQL</div>
       </div>
     </aside>
 
-    <main class="main">
-      <header class="topbar" id="overview">
-        <div class="topbar-intro">
-          <button class="btn btn-icon menu-toggle" id="menuToggle" type="button" aria-label="Open menu">
+    <div class="sidebar-backdrop" id="sidebarBackdrop" aria-hidden="true"></div>
+
+    <!-- Main column: header + content -->
+    <div class="layout-main">
+      <header class="app-header">
+        <div class="header-left">
+          <button type="button" class="btn btn-icon menu-toggle" id="menuToggle" aria-label="Open menu">
             <i data-lucide="menu"></i>
           </button>
-          <div>
-            <h2>Operations overview</h2>
-            <p>Monitor accounts, proxies, and farm automation in real time</p>
+          <div class="header-titles">
+            <nav class="breadcrumb" aria-label="Breadcrumb">
+              <span class="breadcrumb-root">TikTok Farm</span>
+              <i data-lucide="chevron-right" class="breadcrumb-sep"></i>
+              <span class="breadcrumb-current" id="headerPageTitle">Overview</span>
+            </nav>
+            <p class="header-subtitle" id="headerPageSubtitle">Metrics and charts</p>
           </div>
         </div>
-        <div class="topbar-actions">
-          <button class="btn" type="button" id="btnProxyCheck" title="Check all proxies">
-            <i data-lucide="wifi"></i> Proxies
-          </button>
-          <button class="btn" type="button" id="btnReschedule" title="Reschedule all jobs">
-            <i data-lucide="calendar-clock"></i> Reschedule
-          </button>
-          <button class="btn btn-primary" type="button" id="btnRefresh">
-            <i data-lucide="refresh-cw"></i> Refresh
-          </button>
+
+        <div class="header-right">
+          <div class="header-status">
+            <div class="status-pill ok" id="systemStatus">
+              <span class="status-dot"></span>
+              <span id="systemStatusText">Loading…</span>
+            </div>
+            <span class="header-sync">Updated <span id="lastSync">—</span></span>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-ghost" type="button" id="btnProxyCheck" title="Check all proxies">
+              <i data-lucide="wifi"></i>
+              <span class="btn-label">Check proxies</span>
+            </button>
+            <button class="btn btn-ghost" type="button" id="btnReschedule" title="Reschedule jobs">
+              <i data-lucide="calendar-clock"></i>
+              <span class="btn-label">Reschedule</span>
+            </button>
+            <button class="btn btn-primary" type="button" id="btnRefresh">
+              <i data-lucide="refresh-cw"></i>
+              <span class="btn-label">Refresh</span>
+            </button>
+          </div>
         </div>
       </header>
 
+      <main class="page-content">
+      <section class="page-section" id="overview">
       <section class="bento" id="bentoKpis" aria-label="Key metrics">
         <article class="kpi"><div class="skeleton" style="height:4rem"></div></article>
         <article class="kpi"><div class="skeleton" style="height:4rem"></div></article>
@@ -94,28 +164,65 @@
           </div>
         </div>
       </section>
+      </section>
 
-      <section class="section" id="accounts">
-        <h2 class="section-title">
-          <i data-lucide="users" style="width:20px;height:20px"></i>
-          Accounts
-        </h2>
+      <section class="page-section" id="accounts">
+      <section class="section">
+        <div class="section-head">
+          <h2 class="section-title">
+            <i data-lucide="users" style="width:20px;height:20px"></i>
+            TikTok accounts
+          </h2>
+          <div class="section-actions">
+            <input type="search" class="search-input" id="accountSearch" placeholder="Search username…" aria-label="Search accounts">
+            <button class="btn btn-sm" type="button" id="btnAddAccount">
+              <i data-lucide="user-plus"></i> Add
+            </button>
+            <button class="btn btn-sm" type="button" id="btnImportAccounts">
+              <i data-lucide="upload"></i> Import CSV
+            </button>
+            <a class="btn btn-sm" href="/api/templates/accounts.csv" download>
+              <i data-lucide="download"></i> Template
+            </a>
+            <button class="btn btn-sm" type="button" id="btnSyncAllProfiles" title="Sync followers/posts from TikTok">
+              <i data-lucide="refresh-ccw"></i> Sync TikTok
+            </button>
+          </div>
+        </div>
         <div class="table-wrap" id="accountsTable">
           <div class="empty-state">Loading accounts…</div>
         </div>
       </section>
+      </section>
 
-      <section class="section" id="proxies">
-        <h2 class="section-title">
-          <i data-lucide="globe" style="width:20px;height:20px"></i>
-          Proxy pool
-        </h2>
+      <section class="page-section" id="proxies">
+      <section class="section">
+        <div class="section-head">
+          <h2 class="section-title">
+            <i data-lucide="globe" style="width:20px;height:20px"></i>
+            Proxy pool
+          </h2>
+          <div class="section-actions">
+            <input type="search" class="search-input" id="proxySearch" placeholder="Search IP, port, URL…" aria-label="Search proxies">
+            <button class="btn btn-sm" type="button" id="btnAddProxy">
+              <i data-lucide="plus"></i> Add
+            </button>
+            <button class="btn btn-sm" type="button" id="btnImportProxies">
+              <i data-lucide="upload"></i> Import CSV
+            </button>
+            <a class="btn btn-sm" href="/api/templates/proxies.csv" download>
+              <i data-lucide="download"></i> Template
+            </a>
+          </div>
+        </div>
         <div class="table-wrap" id="proxiesTable">
           <div class="empty-state">Loading proxies…</div>
         </div>
       </section>
+      </section>
 
-      <section class="section" id="alerts">
+      <section class="page-section" id="alerts">
+      <section class="section">
         <h2 class="section-title">
           <i data-lucide="bell" style="width:20px;height:20px"></i>
           Active alerts
@@ -124,7 +231,151 @@
           <div class="empty-state">Loading alerts…</div>
         </div>
       </section>
-    </main>
+      </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Account modal -->
+  <div class="modal-backdrop" id="modalAccount" role="dialog" aria-modal="true" aria-labelledby="modalAccountTitle">
+    <div class="modal modal-lg">
+      <div class="modal-header">
+        <h3 id="modalAccountTitle">Manage accounts</h3>
+        <button type="button" class="modal-close" data-close="modalAccount" aria-label="Close">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-tabs">
+          <button type="button" class="tab active" data-tab="account-single">Add one</button>
+          <button type="button" class="tab" data-tab="account-bulk">Bulk import</button>
+        </div>
+        <div id="account-single" class="tab-panel">
+          <div class="form-grid">
+            <div class="form-row">
+              <label for="accUsername">Username *</label>
+              <div class="input-with-btn">
+                <input id="accUsername" type="text" placeholder="tiktok_username" autocomplete="off">
+                <button type="button" class="btn btn-sm" id="btnLookupProfile" title="Fetch public profile from TikTok">
+                  <i data-lucide="search"></i> Lookup
+                </button>
+              </div>
+            </div>
+            <div class="profile-preview" id="accountProfilePreview" hidden></div>
+            <div class="form-row">
+              <label for="accProxyId">Proxy ID</label>
+              <input id="accProxyId" type="number" min="0" value="0" placeholder="1">
+              <p class="form-hint">Match ID from proxy table (1 = first proxy in CSV)</p>
+            </div>
+            <div class="form-row">
+              <label for="accPassword">Password (web login)</label>
+              <input id="accPassword" type="password" placeholder="optional" autocomplete="new-password">
+            </div>
+            <div class="form-row">
+              <label for="accStatus">Status</label>
+              <select id="accStatus">
+                <option value="pending">pending</option>
+                <option value="warming">warming</option>
+                <option value="active">active</option>
+                <option value="paused">paused</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label for="accNotes">Notes</label>
+              <input id="accNotes" type="text" placeholder="pilot batch A">
+            </div>
+          </div>
+        </div>
+        <div id="account-bulk" class="tab-panel" hidden>
+          <div class="form-grid">
+            <div class="form-row">
+              <label for="accCsvFile">Upload CSV file</label>
+              <input id="accCsvFile" type="file" accept=".csv,text/csv">
+            </div>
+            <div class="form-row">
+              <label for="accCsvText">Or paste CSV</label>
+              <textarea id="accCsvText" placeholder="username,proxy_id,password,status,notes&#10;user1,1,pass,pending,"></textarea>
+            </div>
+            <label class="form-check">
+              <input type="checkbox" id="accSkipExisting" checked>
+              Skip existing usernames
+            </label>
+            <p class="form-hint">Supports 100+ rows. Columns: username, proxy_id, password, status, notes</p>
+          </div>
+        </div>
+        <div class="import-result" id="accountImportResult"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" data-close="modalAccount">Cancel</button>
+        <button type="button" class="btn btn-primary" id="btnSubmitAccount">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Proxy modal -->
+  <div class="modal-backdrop" id="modalProxy" role="dialog" aria-modal="true" aria-labelledby="modalProxyTitle">
+    <div class="modal modal-lg">
+      <div class="modal-header">
+        <h3 id="modalProxyTitle">Manage proxies</h3>
+        <button type="button" class="modal-close" data-close="modalProxy" aria-label="Close">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-tabs">
+          <button type="button" class="tab active" data-tab="proxy-single">Add one</button>
+          <button type="button" class="tab" data-tab="proxy-bulk">Bulk import</button>
+        </div>
+        <div id="proxy-single" class="tab-panel">
+          <div class="form-grid">
+            <div class="form-row">
+              <label for="pxIp">IP *</label>
+              <input id="pxIp" type="text" placeholder="1.2.3.4">
+            </div>
+            <div class="form-row">
+              <label for="pxPort">Port *</label>
+              <input id="pxPort" type="number" min="1" max="65535" placeholder="8080">
+            </div>
+            <div class="form-row">
+              <label for="pxProtocol">Protocol</label>
+              <select id="pxProtocol">
+                <option value="http">http</option>
+                <option value="socks5">socks5</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label for="pxUser">Username</label>
+              <input id="pxUser" type="text" placeholder="optional">
+            </div>
+            <div class="form-row">
+              <label for="pxPass">Password</label>
+              <input id="pxPass" type="password" placeholder="optional">
+            </div>
+          </div>
+        </div>
+        <div id="proxy-bulk" class="tab-panel" hidden>
+          <div class="form-grid">
+            <div class="form-row">
+              <label for="pxCsvFile">Upload CSV file</label>
+              <input id="pxCsvFile" type="file" accept=".csv,text/csv">
+            </div>
+            <div class="form-row">
+              <label for="pxCsvText">Or paste CSV</label>
+              <textarea id="pxCsvText" placeholder="ip,port,protocol,username,password,status"></textarea>
+            </div>
+            <label class="form-check">
+              <input type="checkbox" id="pxMerge" checked>
+              Merge with existing (uncheck = replace all)
+            </label>
+          </div>
+        </div>
+        <div class="import-result" id="proxyImportResult"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" data-close="modalProxy">Cancel</button>
+        <button type="button" class="btn btn-primary" id="btnSubmitProxy">Save</button>
+      </div>
+    </div>
   </div>
 
   <div class="toast-container" id="toastContainer" aria-live="polite"></div>

@@ -104,6 +104,11 @@ Pilot: 5 acc → Scale: 100 acc.
 ### 11. Dashboard API (`web/api.py`, `web/templates/`)
 - `GET /api/accounts`, `/accounts/{id}/stats`, `/performance`, `/health`
 - `GET /api/alerts?resolved=0|1` — lọc resolved
+- **TikTok public profile** (optional, [davidteather/TikTok-Api](https://github.com/davidteather/TikTok-Api)):
+  - `GET /api/tiktok/profile/{username}` — tra cứu followers/videos (không ghi DB)
+  - `POST /api/accounts/{id}/sync-profile` — đồng bộ stats vào DB
+  - `POST /api/accounts/sync-profiles` — đồng bộ hàng loạt
+  - Cần `TIKTOK_MS_TOKEN` (cookie `msToken` từ tiktok.com)
 - HTML + Chart.js dashboard
 
 ### 12. Database
@@ -135,6 +140,7 @@ tiktok-farm/
 │   ├── post_engine.py
 │   ├── scheduler.py
 │   ├── health_monitor.py
+│   ├── tiktok_profile.py       # optional TikTok-Api public stats
 │   └── telegram_alert.py
 ├── web/
 │   ├── api.py
@@ -259,6 +265,11 @@ main.py
 - Camoufox anti-detect hiệu quả
 - Hashtag shadowban detection accuracy
 - CAPTCHA / 2FA flows
+
+### ⚠️ TikTok profile lookup (tùy chọn)
+- Thư viện: **TikTokApi** (`pip install TikTokApi`) — unofficial, chỉ đọc dữ liệu public
+- Không thay thế login/upload (vẫn dùng Playwright `post_engine`)
+- `msToken` hết hạn / TikTok chặn bot → cần refresh token
 
 ### ❌ Chưa làm / ngoài scope v1.1
 - React dashboard (dùng HTML + Chart.js)

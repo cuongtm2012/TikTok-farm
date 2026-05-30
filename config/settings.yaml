@@ -48,6 +48,12 @@ warmup:
 accounts:
   yaml_path: "config/accounts.yaml"
 
+# Public profile stats via https://github.com/davidteather/TikTok-Api
+tiktok_profile:
+  enabled: true
+  ms_token: ""          # or env TIKTOK_MS_TOKEN (msToken cookie from tiktok.com)
+  browser: chromium     # chromium | firefox | webkit
+
 content:
   images_per_post: 5
   output_dir: "data/posts/"

@@ -61,6 +61,8 @@ class Proxy:
             "status": self.status,
             "last_checked": self.last_checked,
             "fail_count": self.fail_count,
+            "url": self.url,
+            "endpoint": f"{self.ip}:{self.port}",
         }
 
 
@@ -137,8 +139,74 @@ class ProxyManager:
 
     # ---- CRUD ----
 
+    def _reindex_proxy_ids(self):
+        for i, p in enumerate(self._proxies):
+            p.id = i + 1
+
+    def import_proxies_bulk(
+        self,
+        rows: List[Dict],
+        merge: bool = True,
+    ) -> Dict:
+        """Import proxies from parsed CSV rows. merge=True appends; False replaces all."""
+        result = {"imported": 0, "skipped": 0, "failed": 0, "errors": []}
+
+        if not merge:
+            self._proxies = []
+
+        existing = {(p.ip, p.port) for p in self._proxies}
+
+        for i, raw in enumerate(rows, start=1):
+            ip = (raw.get("ip") or "").strip()
+            if not ip or ip.startswith("#"):
+                result["failed"] += 1
+                result["errors"].append({"row": i, "error": "missing ip"})
+                continue
+
+            try:
+                port = int(raw.get("port") or 0)
+            except (TypeError, ValueError):
+                result["failed"] += 1
+                result["errors"].append({"row": i, "error": "invalid port"})
+                continue
+
+            if port <= 0:
+                result["failed"] += 1
+                result["errors"].append({"row": i, "error": "invalid port"})
+                continue
+
+            key = (ip, port)
+            if key in existing:
+                result["skipped"] += 1
+                continue
+
+            proxy = Proxy(
+                proxy_id=0,
+                ip=ip,
+                port=port,
+                protocol=(raw.get("protocol") or "http").strip() or "http",
+                username=(raw.get("username") or "").strip(),
+                password=(raw.get("password") or "").strip(),
+                status=(raw.get("status") or "active").strip() or "active",
+            )
+            self._proxies.append(proxy)
+            existing.add(key)
+            result["imported"] += 1
+
+        self._reindex_proxy_ids()
+        self.save_to_csv()
+        logger.info(
+            f"Bulk proxy import: {result['imported']} imported, "
+            f"{result['skipped']} skipped, total {len(self._proxies)}"
+        )
+        return result
+
     def add_proxy(self, proxy: Proxy) -> Proxy:
         """Add a new proxy. Returns the added proxy with assigned ID."""
+        key = (proxy.ip, proxy.port)
+        for p in self._proxies:
+            if (p.ip, p.port) == key:
+                return p
         proxy.id = len(self._proxies) + 1
         self._proxies.append(proxy)
         self.save_to_csv()
@@ -150,6 +218,7 @@ class ProxyManager:
         for i, p in enumerate(self._proxies):
             if p.id == proxy_id:
                 self._proxies.pop(i)
+                self._reindex_proxy_ids()
                 self.save_to_csv()
                 logger.info(f"Removed proxy ID {proxy_id}")
                 return True

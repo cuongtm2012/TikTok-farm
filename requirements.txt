@@ -30,3 +30,7 @@ tenacity>=8.2.0
 
 # Redis (APScheduler job store when redis.enabled=true)
 redis>=5.0.0
+
+# Optional: fetch public TikTok profile stats (dashboard sync / lookup)
+# https://github.com/davidteather/TikTok-Api
+TikTokApi>=7.3.0

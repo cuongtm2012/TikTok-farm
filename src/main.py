@@ -36,6 +36,7 @@ from src.post_engine import PostEngine
 from src.scheduler import FarmScheduler
 from src.health_monitor import HealthMonitor
 from src.telegram_alert import TelegramAlert
+from src.tiktok_profile import TikTokProfileService
 
 # Setup logging
 LOG_DIR = Path("logs")
@@ -118,6 +119,7 @@ class AppState:
             session_service=self.session_service,
             warmup_manager=self.warmup_manager,
         )
+        self.tiktok_profile = TikTokProfileService(settings)
 
         self.proxy_manager.load_from_csv()
         # Skip YAML import — use API instead

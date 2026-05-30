@@ -195,6 +195,55 @@ class AccountManager:
             logger.error(f"Failed to save cookies: {e}")
             return False
 
+    def import_accounts_bulk(
+        self,
+        items: List[Dict],
+        skip_existing: bool = True,
+    ) -> Dict:
+        """Import many accounts from parsed CSV/JSON rows."""
+        result = {"imported": 0, "skipped": 0, "failed": 0, "errors": []}
+        valid_statuses = {
+            "pending", "warming", "active", "banned", "shadowbanned", "paused"
+        }
+
+        for i, raw in enumerate(items, start=1):
+            username = (raw.get("username") or "").strip()
+            if not username:
+                result["failed"] += 1
+                result["errors"].append({"row": i, "error": "missing username"})
+                continue
+
+            if skip_existing and self.get_account_by_username(username):
+                result["skipped"] += 1
+                continue
+
+            try:
+                proxy_id = int(raw.get("proxy_id") or 0)
+            except (TypeError, ValueError):
+                proxy_id = 0
+
+            acc = self.add_account(
+                username=username,
+                proxy_id=proxy_id,
+                notes=raw.get("notes") or "",
+                password=raw.get("password") or "",
+            )
+            if not acc:
+                result["skipped"] += 1
+                continue
+
+            status = (raw.get("status") or "").strip().lower()
+            if status and status in valid_statuses:
+                self.set_status(acc.id, status)
+
+            result["imported"] += 1
+
+        logger.info(
+            f"Bulk account import: {result['imported']} imported, "
+            f"{result['skipped']} skipped, {result['failed']} failed"
+        )
+        return result
+
     def load_accounts_from_yaml(self, yaml_path: str = "config/accounts.yaml") -> int:
         """Import accounts from YAML into DB (skip existing usernames)."""
         path = Path(yaml_path)
@@ -324,6 +373,16 @@ class AccountManager:
         except Exception as e:
             logger.error(f"Failed to list accounts: {e}")
             return []
+
+    def apply_tiktok_profile(self, account_id: int, profile: Dict) -> Optional[Account]:
+        """Update account stats from normalized TikTok public profile."""
+        return self.update_account(
+            account_id,
+            followers=profile.get("followers", 0),
+            following=profile.get("following", 0),
+            total_posts=profile.get("video_count", 0),
+            last_active=datetime.now().isoformat(),
+        )
 
     def update_account(self, account_id: int, **kwargs) -> Optional[Account]:
         """Update account fields. Returns updated Account or None."""
