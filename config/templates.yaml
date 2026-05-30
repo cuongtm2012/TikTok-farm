@@ -1,0 +1,93 @@
+templates:
+  default:
+    width: 1080
+    height: 1920
+    background_color: "#FFFFFF"
+    elements:
+      - type: "product_image"
+        x: 0
+        y: 0
+        width: 1080
+        height: 1080
+        fit: "cover"
+      - type: "brand_logo"
+        x: 40
+        y: 40
+        width: 120
+        height: 120
+        fit: "contain"
+      - type: "rating_stars"
+        x: 40
+        y: 1140
+        star_size: 32
+        max_stars: 5
+      - type: "rating_text"
+        x: 240
+        y: 1145
+        font_size: 28
+        color: "#333333"
+      - type: "review_text"
+        x: 40
+        y: 1200
+        width: 1000
+        max_lines: 4
+        font_size: 36
+        color: "#1A1A1A"
+        line_spacing: 1.5
+      - type: "price_tag"
+        x: 40
+        y: 1400
+        font_size: 42
+        color: "#FF0000"
+      - type: "cta_button"
+        x: 340
+        y: 1480
+        width: 400
+        height: 80
+        border_radius: 40
+        background_color: "#FF004F"
+        text_color: "#FFFFFF"
+        text: "Shop Now"
+        font_size: 32
+      - type: "affiliate_disclaimer"
+        x: 40
+        y: 1680
+        font_size: 18
+        color: "#999999"
+        text: "As an Amazon Associate I earn from qualifying purchases."
+  minimal:
+    width: 1080
+    height: 1920
+    background_color: "#F5F5F5"
+    elements:
+      - type: "product_image"
+        x: 0
+        y: 0
+        width: 1080
+        height: 1350
+        fit: "cover"
+      - type: "brand_logo"
+        x: 40
+        y: 40
+        width: 100
+        height: 100
+        fit: "contain"
+      - type: "review_text"
+        x: 40
+        y: 1400
+        width: 1000
+        max_lines: 3
+        font_size: 40
+        color: "#1A1A1A"
+        line_spacing: 1.4
+      - type: "price_tag"
+        x: 40
+        y: 1600
+        font_size: 48
+        color: "#FF0000"
+      - type: "affiliate_disclaimer"
+        x: 40
+        y: 1840
+        font_size: 16
+        color: "#AAAAAA"
+        text: "Affiliate link"

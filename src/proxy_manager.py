@@ -1,0 +1,297 @@
+# TikTok Farm - Proxy Manager Module
+# Manages proxy list CRUD, health checks, and rotation
+
+import csv
+import json
+import logging
+import aiohttp
+import asyncio
+from pathlib import Path
+from typing import Optional, List, Dict
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+class Proxy:
+    """Represents a single proxy entry."""
+
+    def __init__(
+        self,
+        proxy_id: int = 0,
+        ip: str = "",
+        port: int = 0,
+        protocol: str = "http",
+        username: str = "",
+        password: str = "",
+        status: str = "active",
+        last_checked: Optional[str] = None,
+        fail_count: int = 0,
+    ):
+        self.id = proxy_id
+        self.ip = ip
+        self.port = port
+        self.protocol = protocol
+        self.username = username
+        self.password = password
+        self.status = status
+        self.last_checked = last_checked
+        self.fail_count = fail_count
+
+    @property
+    def url(self) -> str:
+        """Return proxy URL string for Playwright/requests."""
+        auth = ""
+        if self.username and self.password:
+            auth = f"{self.username}:{self.password}@"
+        return f"{self.protocol}://{auth}{self.ip}:{self.port}"
+
+    @property
+    def is_alive(self) -> bool:
+        return self.status == "active"
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "ip": self.ip,
+            "port": self.port,
+            "protocol": self.protocol,
+            "username": self.username,
+            "password": self.password,
+            "status": self.status,
+            "last_checked": self.last_checked,
+            "fail_count": self.fail_count,
+        }
+
+
+class ProxyManager:
+    """Manages proxy lifecycle, health checks, and CSV/DB storage."""
+
+    def __init__(self, csv_path: str = "config/proxies.csv", check_timeout: int = 5, max_fail: int = 3):
+        self.csv_path = Path(csv_path)
+        self.check_timeout = check_timeout
+        self.max_fail = max_fail
+        self._proxies: List[Proxy] = []
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    # ---- CSV I/O ----
+
+    def load_from_csv(self) -> List[Proxy]:
+        """Load proxies from CSV file. Returns list of Proxy objects."""
+        self._proxies = []
+        if not self.csv_path.exists():
+            logger.warning(f"Proxy CSV not found at {self.csv_path}. Creating empty.")
+            self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+            self.csv_path.write_text("ip,port,protocol,username,password,status\n")
+            return self._proxies
+
+        try:
+            with open(self.csv_path, "r") as f:
+                reader = csv.DictReader(f)
+                for i, row in enumerate(reader):
+                    # Skip comment lines or empty rows
+                    ip = row.get("ip", "").strip()
+                    if not ip or ip.startswith("#"):
+                        continue
+                    proxy = Proxy(
+                        proxy_id=i + 1,
+                        ip=ip,
+                        port=int(row.get("port", 0)),
+                        protocol=row.get("protocol", "http").strip(),
+                        username=row.get("username", "").strip(),
+                        password=row.get("password", "").strip(),
+                        status=row.get("status", "active").strip(),
+                    )
+                    self._proxies.append(proxy)
+            logger.info(f"Loaded {len(self._proxies)} proxies from CSV")
+        except Exception as e:
+            logger.error(f"Failed to load proxies from CSV: {e}")
+
+        return self._proxies
+
+    def save_to_csv(self):
+        """Save current proxy list back to CSV."""
+        try:
+            self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.csv_path, "w", newline="") as f:
+                fieldnames = ["ip", "port", "protocol", "username", "password", "status"]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for p in self._proxies:
+                    writer.writerow({
+                        "ip": p.ip,
+                        "port": p.port,
+                        "protocol": p.protocol,
+                        "username": p.username,
+                        "password": p.password,
+                        "status": p.status,
+                    })
+            logger.debug(f"Saved {len(self._proxies)} proxies to CSV")
+        except Exception as e:
+            logger.error(f"Failed to save proxies to CSV: {e}")
+
+    # ---- CRUD ----
+
+    def add_proxy(self, proxy: Proxy) -> Proxy:
+        """Add a new proxy. Returns the added proxy with assigned ID."""
+        proxy.id = len(self._proxies) + 1
+        self._proxies.append(proxy)
+        self.save_to_csv()
+        logger.info(f"Added proxy {proxy.ip}:{proxy.port}")
+        return proxy
+
+    def remove_proxy(self, proxy_id: int) -> bool:
+        """Remove a proxy by ID. Returns True if found and removed."""
+        for i, p in enumerate(self._proxies):
+            if p.id == proxy_id:
+                self._proxies.pop(i)
+                self.save_to_csv()
+                logger.info(f"Removed proxy ID {proxy_id}")
+                return True
+        logger.warning(f"Proxy ID {proxy_id} not found for removal")
+        return False
+
+    def update_proxy(self, proxy_id: int, **kwargs) -> Optional[Proxy]:
+        """Update proxy fields. Returns updated Proxy or None."""
+        for p in self._proxies:
+            if p.id == proxy_id:
+                for key, value in kwargs.items():
+                    if hasattr(p, key):
+                        setattr(p, key, value)
+                self.save_to_csv()
+                logger.info(f"Updated proxy ID {proxy_id}")
+                return p
+        logger.warning(f"Proxy ID {proxy_id} not found for update")
+        return None
+
+    def get_proxy(self, proxy_id: int) -> Optional[Proxy]:
+        """Get a proxy by ID."""
+        for p in self._proxies:
+            if p.id == proxy_id:
+                return p
+        return None
+
+    def get_all_proxies(self) -> List[Proxy]:
+        """Get all proxies."""
+        return self._proxies
+
+    def get_alive_proxies(self) -> List[Proxy]:
+        """Get proxies with active status."""
+        return [p for p in self._proxies if p.status == "active"]
+
+    def get_random_proxy(self) -> Optional[Proxy]:
+        """Get a random alive proxy."""
+        import random
+        alive = self.get_alive_proxies()
+        return random.choice(alive) if alive else None
+
+    # ---- Health Checks ----
+
+    async def check_proxy(self, proxy: Proxy) -> bool:
+        """Check if a proxy is alive by making a request to a test URL."""
+        url = "http://httpbin.org/ip"
+        proxy_url = proxy.url
+
+        try:
+            session = await self._get_session()
+            async with session.get(
+                url,
+                proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=self.check_timeout),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logger.debug(f"Proxy {proxy.ip}:{proxy.port} alive. IP: {data.get('origin', 'unknown')}")
+                    proxy.status = "active"
+                    proxy.fail_count = 0
+                    proxy.last_checked = datetime.now().isoformat()
+                    return True
+                else:
+                    logger.warning(f"Proxy {proxy.ip}:{proxy.port} returned status {resp.status}")
+                    proxy.fail_count += 1
+                    proxy.last_checked = datetime.now().isoformat()
+                    if proxy.fail_count >= self.max_fail:
+                        proxy.status = "dead"
+                        logger.warning(f"Proxy {proxy.ip}:{proxy.port} marked as dead after {proxy.fail_count} failures")
+                    return False
+        except asyncio.TimeoutError:
+            logger.warning(f"Proxy {proxy.ip}:{proxy.port} timed out")
+            proxy.fail_count += 1
+            proxy.last_checked = datetime.now().isoformat()
+            if proxy.fail_count >= self.max_fail:
+                proxy.status = "dead"
+            return False
+        except Exception as e:
+            logger.error(f"Proxy {proxy.ip}:{proxy.port} check failed: {e}")
+            proxy.fail_count += 1
+            proxy.last_checked = datetime.now().isoformat()
+            if proxy.fail_count >= self.max_fail:
+                proxy.status = "dead"
+            return False
+
+    async def check_all_proxies(self) -> Dict[str, int]:
+        """Check all proxies concurrently. Returns summary counts."""
+        tasks = [self.check_proxy(p) for p in self._proxies if p.status != "dead"]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        alive = sum(1 for r in results if r is True)
+        dead = sum(1 for r in results if r is False)
+        errors = sum(1 for r in results if isinstance(r, Exception))
+
+        self.save_to_csv()
+        logger.info(f"Proxy health check complete: {alive} alive, {dead} dead, {errors} errors")
+        return {"alive": alive, "dead": dead, "errors": errors}
+
+    def sync_proxies_to_db(self, db_path: str):
+        """Sync current proxy list to SQLite database."""
+        import sqlite3
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS proxies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    protocol TEXT DEFAULT 'http',
+                    username TEXT,
+                    password TEXT,
+                    status TEXT DEFAULT 'active',
+                    last_checked TIMESTAMP,
+                    fail_count INTEGER DEFAULT 0
+                )
+            """)
+            cursor.execute("DELETE FROM proxies")  # Clear and re-insert
+            for p in self._proxies:
+                cursor.execute(
+                    "INSERT INTO proxies (ip, port, protocol, username, password, status, last_checked, fail_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (p.ip, p.port, p.protocol, p.username, p.password, p.status, p.last_checked, p.fail_count),
+                )
+            conn.commit()
+            conn.close()
+            logger.info(f"Synced {len(self._proxies)} proxies to DB")
+        except Exception as e:
+            logger.error(f"Failed to sync proxies to DB: {e}")
+
+    # ---- Cleanup ----
+
+    async def close(self):
+        """Close the HTTP session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    @classmethod
+    def from_settings(cls, settings: dict) -> "ProxyManager":
+        """Create instance from settings dict."""
+        proxy_config = settings.get("proxies", {})
+        return cls(
+            csv_path=proxy_config.get("csv_path", "config/proxies.csv"),
+            check_timeout=proxy_config.get("check_timeout", 5),
+            max_fail=proxy_config.get("max_fail_before_disable", 3),
+        )
