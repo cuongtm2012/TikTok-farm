@@ -214,6 +214,31 @@
             </button>
           </div>
         </div>
+        <div class="panel seller-import-panel">
+          <h3 class="seller-import-title">
+            <i data-lucide="clipboard-paste"></i> Fast import (Seller format)
+          </h3>
+          <p class="form-hint">USER|PASS|EMAIL|EMAIL_PASS|COOKIES|UID — one account per line</p>
+          <textarea id="sellerImportText" rows="6" placeholder="user1|pass1|email@hm.com|mailpass|sessionid=xxx; msToken=yyy|uid123"></textarea>
+          <div class="seller-import-actions">
+            <label class="form-row-inline">
+              Default proxy
+              <select id="sellerImportProxyId" class="search-input" style="width:auto;min-width:10rem">
+                <option value="0">— None / auto —</option>
+              </select>
+            </label>
+            <label class="form-check">
+              <input type="checkbox" id="sellerAutoProxy" title="Assign alive proxies when ID is 0"> Auto-assign proxy
+            </label>
+            <label class="form-check">
+              <input type="checkbox" id="sellerSkipExisting" checked> Skip existing
+            </label>
+            <button type="button" class="btn btn-primary btn-sm" id="btnSellerImport">
+              <i data-lucide="upload"></i> Import accounts
+            </button>
+          </div>
+          <div class="import-result" id="sellerImportResult"></div>
+        </div>
         <div class="table-wrap" id="accountsTable">
           <div class="empty-state">Loading accounts…</div>
         </div>
@@ -313,7 +338,8 @@
       <div class="modal-body">
         <div class="modal-tabs">
           <button type="button" class="tab active" data-tab="account-single">Add one</button>
-          <button type="button" class="tab" data-tab="account-bulk">Bulk import</button>
+          <button type="button" class="tab" data-tab="account-bulk">CSV import</button>
+          <button type="button" class="tab" data-tab="account-seller">Seller format</button>
         </div>
         <div id="account-single" class="tab-panel">
           <div class="form-grid">
@@ -328,9 +354,11 @@
             </div>
             <div class="profile-preview" id="accountProfilePreview" hidden></div>
             <div class="form-row">
-              <label for="accProxyId">Proxy ID</label>
-              <input id="accProxyId" type="number" min="0" value="0" placeholder="1">
-              <p class="form-hint">Match ID from proxy table (1 = first proxy in CSV)</p>
+              <label for="accProxyId">Proxy</label>
+              <select id="accProxyId">
+                <option value="0">— None —</option>
+              </select>
+              <p class="form-hint">Choose from proxy pool or import seller lines with auto-assign</p>
             </div>
             <div class="form-row">
               <label for="accPassword">Password (web login)</label>
@@ -349,6 +377,10 @@
               <label for="accNotes">Notes</label>
               <input id="accNotes" type="text" placeholder="pilot batch A">
             </div>
+            <div class="form-row">
+              <label for="accCookies">Cookies (optional)</label>
+              <textarea id="accCookies" rows="3" placeholder="sessionid=xxx; msToken=yyy; ..."></textarea>
+            </div>
           </div>
         </div>
         <div id="account-bulk" class="tab-panel" hidden>
@@ -365,7 +397,24 @@
               <input type="checkbox" id="accSkipExisting" checked>
               Skip existing usernames
             </label>
-            <p class="form-hint">Supports 100+ rows. Columns: username, proxy_id, password, status, notes</p>
+            <p class="form-hint">Columns: username, proxy_id, password, status, notes, cookie_data</p>
+          </div>
+        </div>
+        <div id="account-seller" class="tab-panel" hidden>
+          <div class="form-grid">
+            <div class="form-row">
+              <label for="accSellerText">Paste seller lines</label>
+              <textarea id="accSellerText" rows="8" placeholder="USER|PASS|EMAIL|EMAIL_PASS|COOKIES|UID"></textarea>
+            </div>
+            <div class="form-row">
+              <label for="accSellerProxyId">Default proxy</label>
+              <select id="accSellerProxyId">
+                <option value="0">— None / auto —</option>
+              </select>
+            </div>
+            <label class="form-check">
+              <input type="checkbox" id="accSellerSkipExisting" checked> Skip existing
+            </label>
           </div>
         </div>
         <div class="import-result" id="accountImportResult"></div>
@@ -373,6 +422,24 @@
       <div class="modal-footer">
         <button type="button" class="btn" data-close="modalAccount">Cancel</button>
         <button type="button" class="btn btn-primary" id="btnSubmitAccount">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Account detail (cookies) -->
+  <div class="modal-backdrop" id="modalAccountDetail" role="dialog" aria-modal="true">
+    <div class="modal modal-lg">
+      <div class="modal-header">
+        <h3 id="accountDetailTitle">Account</h3>
+        <button type="button" class="modal-close" data-close="modalAccountDetail" aria-label="Close">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <div class="modal-body" id="accountDetailBody">
+        <div class="empty-state">Loading…</div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" data-close="modalAccountDetail">Close</button>
       </div>
     </div>
   </div>

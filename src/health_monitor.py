@@ -76,6 +76,16 @@ class HealthMonitor:
             if logged_in_elem:
                 result["logged_in"] = True
                 logger.info(f"[Account {account_id}] Login check: OK")
+                try:
+                    fresh = await page.context.cookies()
+                    if fresh and self.account_mgr:
+                        self.account_mgr.save_cookies(account_id, fresh)
+                        if hasattr(self.browser, "write_storage_state_from_cookies"):
+                            self.browser.write_storage_state_from_cookies(
+                                account_id, fresh
+                            )
+                except Exception as e:
+                    logger.debug(f"[Account {account_id}] Cookie refresh after check: {e}")
             else:
                 result["error"] = "Not logged in"
                 logger.warning(f"[Account {account_id}] Login check: NOT LOGGED IN")

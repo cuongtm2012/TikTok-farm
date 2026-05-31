@@ -572,6 +572,10 @@ class FarmEngine:
                         cookies = await page.context.cookies()
                         if cookies:
                             self.account_mgr.save_cookies(account_id, cookies)
+                            if hasattr(self.browser, "write_storage_state_from_cookies"):
+                                self.browser.write_storage_state_from_cookies(
+                                    account_id, cookies
+                                )
                             logger.info(f"[Account {account_id}] Saved {len(cookies)} cookies to DB")
             except Exception as e:
                 logger.warning(f"[Account {account_id}] Save cookies error: {e}")

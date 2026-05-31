@@ -1,22 +1,131 @@
-# TikTok Farm — CSV / bulk import helpers
+# TikTok Farm — CSV / bulk / seller import helpers
 
 import csv
 import io
-from typing import List, Dict, Tuple
+import json
+from typing import List, Dict, Tuple, Any, Optional
 
 
-ACCOUNT_CSV_FIELDS = ["username", "proxy_id", "password", "status", "notes"]
+ACCOUNT_CSV_FIELDS = ["username", "proxy_id", "password", "status", "notes", "cookie_data"]
 PROXY_CSV_FIELDS = ["ip", "port", "protocol", "username", "password", "status"]
 
-ACCOUNT_CSV_TEMPLATE = """username,proxy_id,password,status,notes
-user1,1,pass123,pending,pilot 1
-user2,2,pass456,warming,pilot 2
+ACCOUNT_CSV_TEMPLATE = """username,proxy_id,password,status,notes,cookie_data
+user1,1,pass123,pending,pilot 1,
+user2,2,pass456,warming,pilot 2,
 """
 
 PROXY_CSV_TEMPLATE = """ip,port,protocol,username,password,status
 1.2.3.4,8080,http,,,active
 5.6.7.8,3128,socks5,user,pass,active
 """
+
+
+def parse_cookie_string(cookie_str: str) -> List[Dict[str, Any]]:
+    """'name=value; name=value' → Playwright cookie objects."""
+    cookies = []
+    if not cookie_str or not str(cookie_str).strip():
+        return cookies
+
+    text = str(cookie_str).strip()
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    for part in text.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        if not name:
+            continue
+        cookies.append({
+            "name": name,
+            "value": value.strip(),
+            "domain": ".tiktok.com",
+            "path": "/",
+            "httpOnly": False,
+            "secure": True,
+            "sameSite": "Lax",
+        })
+    return cookies
+
+
+def parse_seller_line(line: str) -> Dict[str, Any]:
+    """
+    Parse seller format: USER|PASS|EMAIL|EMAIL_PASS|COOKIES|UID
+    If COOKIES contain '|', use 6+ fields: cookie = join(parts[4:-1]), uid = last part.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        raise ValueError("Empty line")
+
+    parts = line.split("|")
+    if len(parts) < 2:
+        raise ValueError("Invalid format: need at least USER|PASS")
+
+    username = parts[0].strip().lstrip("@")
+    password = parts[1].strip()
+    email = parts[2].strip() if len(parts) > 2 else ""
+    email_pass = parts[3].strip() if len(parts) > 3 else ""
+
+    if len(parts) >= 6:
+        uid = parts[-1].strip()
+        cookie_str = "|".join(parts[4:-1]).strip()
+    elif len(parts) == 5:
+        cookie_str = parts[4].strip()
+        uid = ""
+    else:
+        cookie_str = parts[4].strip() if len(parts) > 4 else ""
+        uid = ""
+
+    if not username:
+        raise ValueError("Missing username")
+
+    cookies = parse_cookie_string(cookie_str) if cookie_str else []
+    cookie_data = json.dumps(cookies) if cookies else ""
+
+    notes_parts = []
+    if email:
+        notes_parts.append(f"email={email}")
+    if email_pass:
+        notes_parts.append(f"email_pass={email_pass[:4]}***")
+    if uid:
+        notes_parts.append(f"uid={uid}")
+
+    return {
+        "username": username,
+        "password": password,
+        "email": email,
+        "email_password": email_pass,
+        "cookie_data": cookie_data,
+        "uid": uid,
+        "notes": "; ".join(notes_parts),
+    }
+
+
+def parse_seller_bulk(text: str, default_proxy_id: int = 0) -> Tuple[List[Dict], List[Dict]]:
+    """Parse multiline seller paste. Returns (items, errors)."""
+    items: List[Dict] = []
+    errors: List[Dict] = []
+
+    for i, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            row = parse_seller_line(line)
+            row["proxy_id"] = default_proxy_id
+            row["status"] = "pending"
+            items.append(row)
+        except ValueError as e:
+            errors.append({"row": i, "error": str(e)})
+
+    return items, errors
 
 
 def parse_csv_text(content: str) -> Tuple[List[Dict], List[str]]:
@@ -42,12 +151,22 @@ def parse_csv_text(content: str) -> Tuple[List[Dict], List[str]]:
 
 
 def normalize_account_row(row: Dict) -> Dict:
+    cookie_raw = row.get("cookie_data") or row.get("cookies") or ""
+    cookie_data = ""
+    if cookie_raw:
+        if cookie_raw.strip().startswith("["):
+            cookie_data = cookie_raw.strip()
+        else:
+            cookies = parse_cookie_string(cookie_raw)
+            cookie_data = json.dumps(cookies) if cookies else ""
+
     return {
         "username": row.get("username") or row.get("user") or "",
         "proxy_id": int(row.get("proxy_id") or row.get("proxy") or 0),
         "password": row.get("password") or row.get("pass") or "",
         "status": row.get("status") or "",
         "notes": row.get("notes") or row.get("note") or "",
+        "cookie_data": cookie_data,
     }
 
 

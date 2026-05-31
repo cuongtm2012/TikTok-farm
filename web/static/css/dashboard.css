@@ -992,6 +992,101 @@ tr:hover td { background: rgba(255, 255, 255, 0.02); }
   color: var(--text);
 }
 
+.seller-import-panel {
+  margin-bottom: 1rem;
+  padding: 1rem 1.25rem;
+  border-radius: var(--radius);
+  border: 1px dashed var(--border);
+  background: rgba(254, 44, 85, 0.04);
+}
+
+.seller-import-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+  margin-bottom: 0.5rem;
+}
+
+.seller-import-panel textarea {
+  width: 100%;
+  min-height: 120px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 0.65rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--text);
+  resize: vertical;
+}
+
+.seller-import-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+
+.form-row-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.cookie-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.2rem 0.5rem;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.cookie-badge.ok {
+  background: rgba(16, 185, 129, 0.15);
+  color: var(--success);
+}
+
+.cookie-badge.warn {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--warning);
+}
+
+.cookie-badge.none {
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--danger);
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.link-btn:hover strong {
+  color: var(--accent-2);
+}
+
+.account-detail-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.account-detail-section h4 {
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+  color: var(--text-muted);
+}
+
 .profile-preview .profile-stats {
   display: flex;
   flex-wrap: wrap;

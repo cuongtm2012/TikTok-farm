@@ -5,7 +5,7 @@ import json
 import logging
 import yaml
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timedelta
 import random
 
@@ -61,8 +61,36 @@ class Account:
         except (ValueError, TypeError):
             return 0
 
-    def to_dict(self) -> dict:
+    @staticmethod
+    def cookie_status_from_data(cookie_data: Optional[str]) -> dict:
+        """Build cookie_status dict from cookie_data JSON string."""
+        has_cookies = False
+        cookie_count = 0
+        expired = False
+        has_sessionid = False
+
+        if cookie_data:
+            try:
+                cookies = json.loads(cookie_data)
+                if isinstance(cookies, list) and len(cookies) > 0:
+                    has_cookies = True
+                    cookie_count = len(cookies)
+                    has_sessionid = any(
+                        c.get("name") == "sessionid" for c in cookies if isinstance(c, dict)
+                    )
+                    expired = not has_sessionid
+            except (json.JSONDecodeError, TypeError):
+                pass
+
         return {
+            "has_cookies": has_cookies,
+            "cookie_count": cookie_count,
+            "expired": expired,
+            "has_sessionid": has_sessionid,
+        }
+
+    def to_dict(self, include_cookie_payload: bool = False) -> dict:
+        data = {
             "id": self.id,
             "username": self.username,
             "proxy_id": self.proxy_id,
@@ -74,7 +102,14 @@ class Account:
             "created_at": self.created_at,
             "last_active": self.last_active,
             "notes": self.notes,
+            "cookie_status": self.cookie_status_from_data(self.cookie_data),
         }
+        if include_cookie_payload and self.cookie_data:
+            try:
+                data["cookies"] = json.loads(self.cookie_data)
+            except Exception:
+                data["cookies"] = []
+        return data
 
 
 class AccountManager:
@@ -195,13 +230,53 @@ class AccountManager:
             logger.error(f"Failed to save cookies: {e}")
             return False
 
+    def save_cookies_from_string(self, account_id: int, cookie_input) -> Tuple[bool, List]:
+        """
+        Parse cookie string or JSON/list and save to DB.
+        Returns (success, cookies_list).
+        """
+        from src.import_utils import parse_cookie_string
+
+        cookies: list = []
+        if isinstance(cookie_input, list):
+            cookies = cookie_input
+        elif isinstance(cookie_input, str) and cookie_input.strip():
+            text = cookie_input.strip()
+            if text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        cookies = parsed
+                except json.JSONDecodeError:
+                    cookies = parse_cookie_string(text)
+            else:
+                cookies = parse_cookie_string(text)
+
+        if not cookies:
+            return False, []
+
+        ok = self.save_cookies(account_id, cookies)
+        return ok, cookies
+
+    def clear_cookies(self, account_id: int) -> bool:
+        return self.update_account(account_id, cookie_data="") is not None
+
     def import_accounts_bulk(
         self,
         items: List[Dict],
         skip_existing: bool = True,
+        require_cookies: bool = False,
+        default_status_with_cookies: str = "",
+        browser_manager=None,
     ) -> Dict:
         """Import many accounts from parsed CSV/JSON rows."""
-        result = {"imported": 0, "skipped": 0, "failed": 0, "errors": []}
+        result = {
+            "imported": 0,
+            "skipped": 0,
+            "failed": 0,
+            "without_cookies": 0,
+            "errors": [],
+        }
         valid_statuses = {
             "pending", "warming", "active", "banned", "shadowbanned", "paused"
         }
@@ -215,6 +290,16 @@ class AccountManager:
 
             if skip_existing and self.get_account_by_username(username):
                 result["skipped"] += 1
+                continue
+
+            cookie_raw = raw.get("cookie_data") or ""
+            has_cookie_payload = bool(cookie_raw and cookie_raw.strip())
+            if require_cookies and not has_cookie_payload:
+                result["without_cookies"] += 1
+                result["failed"] += 1
+                result["errors"].append(
+                    {"row": i, "username": username, "error": "missing cookies (required)"}
+                )
                 continue
 
             try:
@@ -233,8 +318,39 @@ class AccountManager:
                 continue
 
             status = (raw.get("status") or "").strip().lower()
+            if not status and has_cookie_payload and default_status_with_cookies:
+                status = default_status_with_cookies
             if status and status in valid_statuses:
                 self.set_status(acc.id, status)
+
+            if cookie_raw:
+                try:
+                    if cookie_raw.strip().startswith("["):
+                        cookies = json.loads(cookie_raw)
+                    else:
+                        from src.import_utils import parse_cookie_string
+                        cookies = parse_cookie_string(cookie_raw)
+                    if cookies:
+                        self.save_cookies(acc.id, cookies)
+                        result.setdefault("with_cookies", 0)
+                        result["with_cookies"] += 1
+                        if browser_manager:
+                            browser_manager.write_storage_state_from_cookies(
+                                acc.id, cookies
+                            )
+                    elif require_cookies:
+                        result["failed"] += 1
+                        result["errors"].append(
+                            {"row": i, "username": username, "error": "invalid cookies"}
+                        )
+                        continue
+                except Exception as e:
+                    result["errors"].append(
+                        {"row": i, "username": username, "error": f"cookies: {e}"}
+                    )
+                    if require_cookies:
+                        result["failed"] += 1
+                        continue
 
             result["imported"] += 1
 

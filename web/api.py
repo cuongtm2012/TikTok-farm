@@ -1,10 +1,11 @@
 # TikTok Farm - Web API Routes
 # FastAPI routes for dashboard and management
 
+import json
 import logging
 import os
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Any
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -26,8 +27,21 @@ if FASTAPI_AVAILABLE:
         username: str
         proxy_id: int = 0
         password: str = ""
+        cookie_data: str = ""
+        email: str = ""
+        email_password: str = ""
         notes: str = ""
         status: Optional[str] = None
+
+    class SellerImportBody(BaseModel):
+        accounts: str
+        proxy_id: int = 0
+        skip_existing: bool = True
+        require_cookies: bool = True
+        auto_assign_proxy: bool = False
+
+    class CookieUpdateBody(BaseModel):
+        cookie_data: Any = ""
 
     class AccountBulkBody(BaseModel):
         accounts: List[AccountCreateBody] = Field(default_factory=list)
@@ -59,6 +73,59 @@ else:
 def get_state(request: Request):
     """Get the app state from request."""
     return request.app.state.farm
+
+
+def _apply_cookies_to_account(state, account_id: int, cookie_input: Any) -> dict:
+    """Parse, save cookies to DB, write storage_state.json."""
+    ok, cookies = state.account_manager.save_cookies_from_string(account_id, cookie_input)
+    if ok and cookies:
+        state.browser_manager.write_storage_state_from_cookies(account_id, cookies)
+    account = state.account_manager.get_account(account_id)
+    return {
+        "saved": ok,
+        "cookie_count": len(cookies),
+        "cookie_status": account.cookie_status_from_data(account.cookie_data) if account else {},
+    }
+
+
+def _append_email_notes(state, account_id: int, email: str, email_password: str):
+    if not email:
+        return
+    account = state.account_manager.get_account(account_id)
+    if not account:
+        return
+    extra = f"email={email}"
+    if email_password:
+        extra += f"|email_pass={email_password[:4]}***"
+    old = account.notes or ""
+    notes = f"{old}; {extra}" if old else extra
+    state.account_manager.update_account(account_id, notes=notes)
+
+
+def _create_account_from_body(state, body: "AccountCreateBody"):
+    account = state.account_manager.add_account(
+        username=body.username.strip(),
+        proxy_id=body.proxy_id,
+        notes=body.notes,
+        password=body.password,
+    )
+    if not account:
+        raise HTTPException(status_code=400, detail="Account already exists or creation failed")
+
+    if body.cookie_data:
+        try:
+            _apply_cookies_to_account(state, account.id, body.cookie_data)
+        except Exception as e:
+            logger.warning(f"Failed to save cookies for acc {account.id}: {e}")
+
+    if body.email:
+        _append_email_notes(state, account.id, body.email, body.email_password)
+
+    if body.status:
+        state.account_manager.set_status(account.id, body.status)
+
+    account = state.account_manager.get_account(account.id)
+    return account
 
 
 # ---- Account Endpoints ----
@@ -126,21 +193,6 @@ async def get_account_stats(request: Request, account_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _create_account_from_body(state, body: "AccountCreateBody"):
-    account = state.account_manager.add_account(
-        username=body.username.strip(),
-        proxy_id=body.proxy_id,
-        notes=body.notes,
-        password=body.password,
-    )
-    if not account:
-        raise HTTPException(status_code=400, detail="Account already exists or creation failed")
-    if body.status:
-        state.account_manager.set_status(account.id, body.status)
-        account = state.account_manager.get_account(account.id)
-    return account
-
-
 @router.post("/accounts")
 async def create_account(
     request: Request,
@@ -202,13 +254,93 @@ async def import_accounts(
             raise HTTPException(status_code=400, detail="; ".join(parse_errors))
 
         items = [normalize_account_row(r) for r in rows]
-        result = state.account_manager.import_accounts_bulk(items, skip_existing=skip)
+        acc_cfg = state.settings.get("accounts", {})
+        result = state.account_manager.import_accounts_bulk(
+            items,
+            skip_existing=skip,
+            require_cookies=acc_cfg.get("require_cookies_on_import", False),
+            default_status_with_cookies=acc_cfg.get("status_with_cookies", ""),
+            browser_manager=state.browser_manager,
+        )
+        _sync_storage_states_after_import(state, result)
         state.scheduler.reschedule_all()
         return {"success": True, "total_rows": len(rows), **result}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Account import error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _sync_storage_states_after_import(state, result: dict):
+    """Write storage_state for accounts that got cookies during bulk import."""
+    if not result.get("with_cookies"):
+        return
+    for acc in state.account_manager.get_all_accounts():
+        if not acc.cookie_data:
+            continue
+        try:
+            cookies = json.loads(acc.cookie_data)
+            if isinstance(cookies, list) and cookies:
+                state.browser_manager.write_storage_state_from_cookies(acc.id, cookies)
+        except Exception:
+            pass
+
+
+def _assign_proxies_round_robin(state, items: List[dict]) -> None:
+    """Fill proxy_id=0 rows from alive proxy pool."""
+    proxies = state.proxy_manager.get_alive_proxies()
+    if not proxies:
+        return
+    idx = 0
+    for item in items:
+        if int(item.get("proxy_id") or 0) == 0:
+            p = proxies[idx % len(proxies)]
+            item["proxy_id"] = p.id
+            idx += 1
+
+
+@router.post("/accounts/import/seller")
+async def import_accounts_seller(request: Request, body: "SellerImportBody"):
+    """Import accounts from seller format: USER|PASS|EMAIL|EMAIL_PASS|COOKIES|UID"""
+    from src.import_utils import parse_seller_bulk
+
+    state = get_state(request)
+    try:
+        items, parse_errors = parse_seller_bulk(body.accounts, body.proxy_id)
+        if not items and parse_errors:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No valid lines; errors: {parse_errors[:5]}",
+            )
+
+        if body.auto_assign_proxy:
+            _assign_proxies_round_robin(state, items)
+
+        acc_cfg = state.settings.get("accounts", {})
+        require_cookies = body.require_cookies
+        if acc_cfg.get("require_cookies_on_seller_import") is not None:
+            require_cookies = bool(acc_cfg["require_cookies_on_seller_import"])
+
+        result = state.account_manager.import_accounts_bulk(
+            items,
+            skip_existing=body.skip_existing,
+            require_cookies=require_cookies,
+            default_status_with_cookies=acc_cfg.get("status_with_cookies", "warming"),
+            browser_manager=state.browser_manager,
+        )
+        result["parse_errors"] = parse_errors
+        _sync_storage_states_after_import(state, result)
+        state.scheduler.reschedule_all()
+        return {
+            "success": True,
+            "total_lines": len(items) + len(parse_errors),
+            **result,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Seller import error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -224,12 +356,18 @@ async def import_accounts_json(request: Request, body: "AccountBulkBody"):
                 "password": a.password,
                 "notes": a.notes,
                 "status": a.status or "",
+                "cookie_data": a.cookie_data or "",
             }
             for a in body.accounts
         ]
+        acc_cfg = state.settings.get("accounts", {})
         result = state.account_manager.import_accounts_bulk(
-            items, skip_existing=body.skip_existing
+            items,
+            skip_existing=body.skip_existing,
+            browser_manager=state.browser_manager,
+            default_status_with_cookies=acc_cfg.get("status_with_cookies", ""),
         )
+        _sync_storage_states_after_import(state, result)
         state.scheduler.reschedule_all()
         return {"success": True, "total_rows": len(items), **result}
     except Exception as e:
@@ -278,12 +416,77 @@ async def delete_account(request: Request, account_id: int):
         deleted = state.account_manager.delete_account(account_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Account not found")
+        state.browser_manager.delete_storage_state(account_id)
         return {"success": True, "message": f"Account {account_id} deleted"}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error deleting account {account_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/accounts/{account_id}/cookies")
+async def update_account_cookies(
+    request: Request, account_id: int, body: "CookieUpdateBody"
+):
+    """Update cookies for an account (string or JSON array)."""
+    state = get_state(request)
+    account = state.account_manager.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    try:
+        info = _apply_cookies_to_account(state, account_id, body.cookie_data)
+        if not info["saved"]:
+            raise HTTPException(status_code=400, detail="No valid cookies parsed")
+        account = state.account_manager.get_account(account_id)
+        return {"success": True, "account": account.to_dict(), **info}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Cookie update failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/accounts/{account_id}/cookies")
+async def get_account_cookies(request: Request, account_id: int):
+    """Get cookies for debug (requires app.debug=true)."""
+    state = get_state(request)
+    debug = state.settings.get("app", {}).get("debug", False)
+    if not debug:
+        raise HTTPException(status_code=403, detail="Cookie dump disabled (set app.debug=true)")
+
+    account = state.account_manager.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    cookies = []
+    if account.cookie_data:
+        try:
+            cookies = json.loads(account.cookie_data)
+        except json.JSONDecodeError:
+            pass
+
+    return {
+        "success": True,
+        "account_id": account_id,
+        "cookie_count": len(cookies) if isinstance(cookies, list) else 0,
+        "cookies": cookies,
+        "cookie_status": account.cookie_status_from_data(account.cookie_data),
+    }
+
+
+@router.delete("/accounts/{account_id}/cookies")
+async def delete_account_cookies(request: Request, account_id: int):
+    """Clear cookies and storage_state for an account."""
+    state = get_state(request)
+    account = state.account_manager.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    state.account_manager.clear_cookies(account_id)
+    state.browser_manager.delete_storage_state(account_id)
+    account = state.account_manager.get_account(account_id)
+    return {"success": True, "account": account.to_dict()}
 
 
 # ---- TikTok public profile (davidteather/TikTok-Api) ----

@@ -47,6 +47,8 @@ warmup:
 accounts:
   yaml_path: "config/accounts.yaml"
   real_account_ids: [1, 2, 3]
+  require_cookies_on_seller_import: true
+  status_with_cookies: warming
 
 tiktok_profile:
   enabled: true

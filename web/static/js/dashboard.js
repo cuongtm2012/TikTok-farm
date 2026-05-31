@@ -127,6 +127,45 @@ function initials(username) {
   return (username || "?").slice(0, 2).toUpperCase();
 }
 
+function proxyLabel(proxyId) {
+  if (!proxyId) return "—";
+  const p = proxiesCache.find((x) => x.id === proxyId);
+  if (p) return `${proxyId}: ${p.ip}`;
+  return String(proxyId);
+}
+
+function populateProxySelects() {
+  const options =
+    '<option value="0">— None / auto —</option>' +
+    proxiesCache
+      .map(
+        (p) =>
+          `<option value="${p.id}">${escapeHtml(p.ip)}:${p.port} (#${p.id})</option>`
+      )
+      .join("");
+  ["sellerImportProxyId", "accSellerProxyId", "accProxyId"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const prev = el.value;
+    if (el.tagName === "SELECT") {
+      el.innerHTML = options;
+      if (prev) el.value = prev;
+    }
+  });
+}
+
+function cookieBadgeHtml(account) {
+  const cs = account.cookie_status || {};
+  const n = cs.cookie_count || 0;
+  if (!cs.has_cookies) {
+    return '<span class="cookie-badge none">🍪 0</span>';
+  }
+  if (cs.expired || !cs.has_sessionid) {
+    return `<span class="cookie-badge warn" title="No sessionid">🍪 ${n}</span>`;
+  }
+  return `<span class="cookie-badge ok" title="sessionid OK">🍪 ${n} OK</span>`;
+}
+
 async function refreshAll() {
   const btn = document.getElementById("btnRefresh");
   if (btn) btn.disabled = true;
@@ -443,10 +482,11 @@ function renderAccountsTable() {
       <thead>
         <tr>
           <th>Account</th>
+          <th>Proxy</th>
           <th>Status</th>
+          <th>Cookies</th>
           <th>Followers</th>
           <th>Posts</th>
-          <th>Views</th>
           <th>Last active</th>
           <th>Actions</th>
         </tr>
@@ -460,15 +500,18 @@ function renderAccountsTable() {
               <div class="user-cell">
                 <div class="avatar">${initials(a.username)}</div>
                 <div>
-                  <strong>@${escapeHtml(a.username)}</strong>
-                  <div style="font-size:0.7rem;color:var(--text-dim)">ID ${a.id} · proxy ${a.proxy_id || "—"}</div>
+                  <button type="button" class="link-btn" data-view-account="${a.id}">
+                    <strong>@${escapeHtml(a.username)}</strong>
+                  </button>
+                  <div style="font-size:0.7rem;color:var(--text-dim)">ID ${a.id}</div>
                 </div>
               </div>
             </td>
+            <td class="cell-mono" title="Proxy ID">${escapeHtml(proxyLabel(a.proxy_id))}</td>
             <td><span class="badge ${BADGE_CLASS[a.status] || "badge-pending"}">${a.status}</span></td>
+            <td>${cookieBadgeHtml(a)}</td>
             <td style="font-family:var(--font-mono)">${formatNum(a.followers)}</td>
             <td style="font-family:var(--font-mono)">${a.total_posts || 0}</td>
-            <td style="font-family:var(--font-mono)">${formatNum(a.total_views)}</td>
             <td style="font-size:0.8rem;color:var(--text-muted)">${formatDate(a.last_active)}</td>
             <td>
               <div class="actions">
@@ -497,7 +540,114 @@ function renderAccountsTable() {
       else runAction(btn.dataset.action, id);
     });
   });
+  wrap.querySelectorAll("[data-view-account]").forEach((btn) => {
+    btn.addEventListener("click", () => openAccountDetail(parseInt(btn.dataset.viewAccount, 10)));
+  });
   if (typeof lucide !== "undefined") lucide.createIcons();
+}
+
+async function openAccountDetail(accountId) {
+  const body = document.getElementById("accountDetailBody");
+  const title = document.getElementById("accountDetailTitle");
+  if (!body) return;
+  openModal("modalAccountDetail");
+  body.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const r = await API.get(`/api/accounts/${accountId}`);
+    const a = r.account;
+    if (title) title.textContent = `@${a.username}`;
+    const cs = a.cookie_status || {};
+    body.innerHTML = `
+      <div class="account-detail-grid">
+        <div class="account-detail-section">
+          <h4>Account</h4>
+          <p>ID ${a.id} · Proxy ${a.proxy_id || "—"} · <span class="badge ${BADGE_CLASS[a.status] || ""}">${a.status}</span></p>
+          <p style="font-size:0.8rem;color:var(--text-dim)">${escapeHtml(a.notes || "—")}</p>
+        </div>
+        <div class="account-detail-section">
+          <h4>Cookies</h4>
+          <p>${cookieBadgeHtml(a)} ${cs.has_sessionid ? "· sessionid present" : cs.has_cookies ? "· missing sessionid" : ""}</p>
+          <textarea id="detailCookieInput" rows="4" placeholder="Paste cookie string: name=value; ..."></textarea>
+          <div class="actions" style="margin-top:0.5rem">
+            <button type="button" class="btn btn-sm btn-primary" id="btnDetailSaveCookies">Update cookies</button>
+            <button type="button" class="btn btn-sm" id="btnDetailDeleteCookies">Delete cookies</button>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById("btnDetailSaveCookies")?.addEventListener("click", async () => {
+      const val = document.getElementById("detailCookieInput")?.value?.trim();
+      if (!val) {
+        toast("Paste cookie string first", "error");
+        return;
+      }
+      try {
+        await API.postJson(`/api/accounts/${accountId}/cookies`, { cookie_data: val });
+        toast("Cookies updated");
+        closeModal("modalAccountDetail");
+        refreshAccounts();
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    });
+    document.getElementById("btnDetailDeleteCookies")?.addEventListener("click", async () => {
+      if (!confirm("Clear cookies for this account?")) return;
+      try {
+        await API.delete(`/api/accounts/${accountId}/cookies`);
+        toast("Cookies cleared");
+        closeModal("modalAccountDetail");
+        refreshAccounts();
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    });
+    if (typeof lucide !== "undefined") lucide.createIcons();
+  } catch (e) {
+    body.innerHTML = `<div class="empty-state">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function submitSellerImport(resultElId = "sellerImportResult") {
+  const fromPanel = document.getElementById("sellerImportText")?.value?.trim();
+  const fromModal = document.getElementById("accSellerText")?.value?.trim();
+  const text = resultElId === "accountImportResult" ? fromModal || fromPanel : fromPanel || fromModal;
+
+  const proxyEl =
+    resultElId === "accountImportResult"
+      ? document.getElementById("accSellerProxyId") || document.getElementById("sellerImportProxyId")
+      : document.getElementById("sellerImportProxyId") || document.getElementById("accSellerProxyId");
+  const proxyId = parseInt(proxyEl?.value || "0", 10);
+
+  const skipEl =
+    resultElId === "accountImportResult"
+      ? document.getElementById("accSellerSkipExisting") || document.getElementById("sellerSkipExisting")
+      : document.getElementById("sellerSkipExisting") || document.getElementById("accSellerSkipExisting");
+  const skip = skipEl?.checked ?? true;
+
+  if (!text) {
+    toast("Paste seller format accounts first", "error");
+    return;
+  }
+
+  const btn = document.getElementById("btnSellerImport");
+  setButtonLoading(btn, true);
+  try {
+    const autoProxy = document.getElementById("sellerAutoProxy")?.checked ?? false;
+    const r = await API.postJson("/api/accounts/import/seller", {
+      accounts: text,
+      proxy_id: proxyId,
+      skip_existing: skip,
+      require_cookies: true,
+      auto_assign_proxy: autoProxy,
+    });
+    showImportResult(resultElId, r);
+    const errN = (r.parse_errors || []).length;
+    toast(`Imported ${r.imported || 0}${errN ? `, ${errN} line errors` : ""}`);
+    await refreshAll();
+  } catch (e) {
+    toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
+  }
 }
 
 async function refreshProxies() {
@@ -509,6 +659,7 @@ async function refreshProxies() {
     return;
   }
   proxiesCache = data.proxies || [];
+  populateProxySelects();
   renderProxiesTable();
   const badge = document.getElementById("navBadgeProxies");
   if (badge) badge.textContent = String(proxiesCache.length);
@@ -1087,10 +1238,14 @@ function showImportResult(elId, result) {
   if (!el) return;
   const errCount = (result.errors || []).length;
   el.className = "import-result show" + (errCount ? " has-errors" : "");
+  const parseErr = (result.parse_errors || []).length;
   el.innerHTML = `
     <strong>Import complete</strong><br>
     Imported: ${result.imported ?? 0} · Skipped: ${result.skipped ?? 0} · Failed: ${result.failed ?? 0}
+    ${result.with_cookies != null ? `<br>With cookies: ${result.with_cookies}` : ""}
+    ${result.without_cookies != null ? `<br>Missing cookies: ${result.without_cookies}` : ""}
     ${result.total_rows != null ? `<br>Rows in file: ${result.total_rows}` : ""}
+    ${parseErr ? `<br><span style="color:var(--warning)">${parseErr} parse error(s)</span>` : ""}
     ${errCount ? `<br><span style="color:var(--warning)">${errCount} row error(s)</span>` : ""}`;
 }
 
@@ -1098,6 +1253,10 @@ async function submitAccountModal() {
   const btn = document.getElementById("btnSubmitAccount");
   if (btn) btn.disabled = true;
   try {
+    if (accountModalTab === "account-seller") {
+      await submitSellerImport("accountImportResult");
+      return;
+    }
     if (accountModalTab === "account-bulk") {
       const file = document.getElementById("accCsvFile")?.files?.[0];
       const csvText = document.getElementById("accCsvText")?.value?.trim() || "";
@@ -1122,13 +1281,16 @@ async function submitAccountModal() {
         toast("Username is required", "error");
         return;
       }
-      await API.postJson("/api/accounts", {
+      const payload = {
         username,
         proxy_id: parseInt(document.getElementById("accProxyId")?.value || "0", 10),
         password: document.getElementById("accPassword")?.value || "",
         notes: document.getElementById("accNotes")?.value || "",
         status: document.getElementById("accStatus")?.value || "pending",
-      });
+      };
+      const cookies = document.getElementById("accCookies")?.value?.trim();
+      if (cookies) payload.cookie_data = cookies;
+      await API.postJson("/api/accounts", payload);
       toast(`Account @${username} created`);
       closeModal("modalAccount");
       await refreshAll();
@@ -1281,6 +1443,9 @@ function init() {
   document.getElementById("btnReschedule")?.addEventListener("click", rescheduleJobs);
   document.getElementById("btnAffiliateScan")?.addEventListener("click", scanAffiliateProducts);
   document.getElementById("btnAffiliateRefresh")?.addEventListener("click", refreshAffiliate);
+  document.getElementById("btnSellerImport")?.addEventListener("click", () =>
+    submitSellerImport("sellerImportResult")
+  );
 
   refreshAll();
   refreshTimer = setInterval(refreshAll, 60000);

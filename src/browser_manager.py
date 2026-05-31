@@ -101,6 +101,34 @@ class BrowserManager:
     def _storage_state_path(self, account_id: int) -> Path:
         return self.profile_dir / str(account_id) / "storage_state.json"
 
+    def write_storage_state_from_cookies(self, account_id: int, cookies: list) -> bool:
+        """Create storage_state.json from cookie list (no browser required)."""
+        if not cookies:
+            return False
+        try:
+            path = self._storage_state_path(account_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            state = {"cookies": cookies, "origins": []}
+            path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            logger.info(
+                f"Created storage_state for account {account_id} ({len(cookies)} cookies)"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to write storage_state for {account_id}: {e}")
+            return False
+
+    def delete_storage_state(self, account_id: int) -> bool:
+        try:
+            path = self._storage_state_path(account_id)
+            if path.exists():
+                path.unlink()
+                logger.info(f"Deleted storage_state for account {account_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to delete storage_state: {e}")
+            return False
+
     async def create_context(
         self,
         account_id: int,
