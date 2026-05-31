@@ -39,8 +39,15 @@ const API = {
       const d = j.detail;
       if (typeof d === "string") return d;
       if (Array.isArray(d)) return d.map((x) => x.msg || x).join(", ");
+      if (d && typeof d === "object" && d.error_type) {
+        const err = new Error(d.error || "Request failed");
+        err.errorType = d.error_type;
+        err.profilePayload = d;
+        throw err;
+      }
       return JSON.stringify(d);
-    } catch {
+    } catch (e) {
+      if (e && e.errorType) throw e;
       return `${path} → ${res.status}`;
     }
   },
@@ -56,6 +63,9 @@ let proxyPage = 1;
 const PAGE_SIZE = 25;
 let accountModalTab = "account-single";
 let proxyModalTab = "proxy-single";
+let postsCache = [];
+let liveWs = null;
+let liveSessionMeta = { type: "farm", accountId: null, duration: 15 };
 
 const STATUS_COLORS = {
   active: "#10b981",
@@ -178,6 +188,7 @@ async function refreshAll() {
       refreshAlerts(),
       refreshAffiliate(),
       refreshSettings(),
+      refreshPosts(),
     ]);
     updateLastSync();
   } catch (e) {
@@ -466,7 +477,7 @@ function renderAccountsTable() {
       <div class="empty-state">
         <p>No accounts yet</p>
         <p style="margin-top:0.5rem;font-size:0.8rem">Use <strong>Add</strong> or <strong>Import CSV</strong> for bulk (100+ rows)</p>
-        <p style="margin-top:0.35rem;font-size:0.75rem;color:var(--text-dim)">After adding, use <strong>Lookup</strong> or <strong>Sync TikTok</strong> to pull followers &amp; posts (needs TIKTOK_MS_TOKEN)</p>
+        <p style="margin-top:0.35rem;font-size:0.75rem;color:var(--text-dim)">After adding, use <strong>Lookup</strong> or <strong>Sync</strong> to pull followers &amp; posts (browser scanner, no API token)</p>
       </div>`;
     return;
   }
@@ -516,7 +527,13 @@ function renderAccountsTable() {
             <td>
               <div class="actions">
                 <button class="btn btn-sm" type="button" data-action="farm" data-id="${a.id}">Farm</button>
-                <button class="btn btn-sm" type="button" data-action="post" data-id="${a.id}">Post</button>
+                <div class="dropdown actions-dropdown">
+                  <button class="btn btn-sm dropdown-toggle" type="button" data-action="post-menu" data-id="${a.id}">Post ▼</button>
+                  <div class="dropdown-menu">
+                    <button type="button" data-action="compose" data-id="${a.id}">Compose</button>
+                    <button type="button" data-action="quick-post" data-id="${a.id}">Quick Post</button>
+                  </div>
+                </div>
                 <button class="btn btn-sm" type="button" data-action="sync" data-id="${a.id}" title="Sync TikTok profile">Sync</button>
                 <button class="btn btn-sm" type="button" data-action="check" data-id="${a.id}">Check</button>
                 <button class="btn btn-sm" type="button" data-action="delete" data-id="${a.id}" title="Delete">Del</button>
@@ -534,10 +551,23 @@ function renderAccountsTable() {
   });
 
   wrap.querySelectorAll("[data-action]").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", (e) => {
       const id = parseInt(btn.dataset.id, 10);
-      if (btn.dataset.action === "delete") deleteAccount(id);
-      else runAction(btn.dataset.action, id);
+      const action = btn.dataset.action;
+      if (action === "post-menu") {
+        e.stopPropagation();
+        const dd = btn.closest(".actions-dropdown");
+        document.querySelectorAll(".actions-dropdown.open").forEach((d) => {
+          if (d !== dd) d.classList.remove("open");
+        });
+        dd?.classList.toggle("open");
+        return;
+      }
+      document.querySelectorAll(".actions-dropdown.open").forEach((d) => d.classList.remove("open"));
+      if (action === "delete") deleteAccount(id);
+      else if (action === "compose") openPostComposer(id);
+      else if (action === "quick-post") quickPost(id);
+      else runAction(action, id);
     });
   });
   wrap.querySelectorAll("[data-view-account]").forEach((btn) => {
@@ -816,19 +846,38 @@ async function refreshAlerts() {
 function renderProfilePreview(el, profile) {
   if (!el) return;
   el.hidden = false;
+  const name = profile.display_name || profile.nickname || profile.username;
+  const posts = profile.total_posts ?? profile.video_count ?? 0;
+  const likes = profile.likes ?? profile.heart_count ?? 0;
+  const profileUrl =
+    profile.profile_url || `https://www.tiktok.com/@${profile.username || ""}`;
   el.innerHTML = `
     <strong>@${escapeHtml(profile.username)}</strong>
     ${profile.verified ? ' <span class="badge badge-active">verified</span>' : ""}
-    <div>${escapeHtml(profile.nickname || "")}</div>
+    ${profile.private_account ? ' <span class="badge badge-pending">private</span>' : ""}
+    <div>${escapeHtml(name)}</div>
     ${profile.bio ? `<div style="color:var(--text-dim);margin-top:0.25rem">${escapeHtml(profile.bio)}</div>` : ""}
     <div class="profile-stats">
       <span>${formatNum(profile.followers)} followers</span>
       <span>${formatNum(profile.following)} following</span>
-      <span>${profile.video_count ?? 0} videos</span>
-      <span>${formatNum(profile.heart_count)} likes</span>
+      <span>${posts} videos</span>
+      <span>${formatNum(likes)} likes</span>
     </div>
-    <a href="${escapeHtml(profile.profile_url)}" target="_blank" rel="noopener" style="font-size:0.75rem;margin-top:0.35rem;display:inline-block">Open on TikTok</a>
+    <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener" style="font-size:0.75rem;margin-top:0.35rem;display:inline-block">Open on TikTok</a>
   `;
+}
+
+function profileErrorToast(result, username) {
+  const t = result?.error_type;
+  const u = username || result?.username || "";
+  const messages = {
+    timeout: "⏱ Timeout — TikTok không phản hồi. Kiểm tra proxy hoặc thử lại.",
+    blocked: "🚫 TikTok chặn request từ IP này. Thử đổi proxy.",
+    not_found: `❌ Account @${u} không tồn tại hoặc đã bị banned.`,
+    private: `🔒 Account @${u} đang ở chế độ riêng tư.`,
+    captcha: "🤖 TikTok yêu cầu captcha. Thử lại sau 30 giây.",
+  };
+  return messages[t] || result?.error || "Profile scan failed";
 }
 
 async function lookupTikTokProfile() {
@@ -842,10 +891,18 @@ async function lookupTikTokProfile() {
   setButtonLoading(btn, true);
   const toastEl = toast("Fetching TikTok profile\u2026", "loading");
   try {
-    const r = await API.get(`/api/tiktok/profile/${encodeURIComponent(username)}`);
+    const r = await API.post(`/api/profile/scan/${encodeURIComponent(username)}`);
     clearToast(toastEl);
-    renderProfilePreview(preview, r.profile);
-    toast(`@${r.profile.username} \u2014 ${formatNum(r.profile.followers)} followers`);
+    if (!r.success) {
+      toast(profileErrorToast(r, username), "error");
+      if (preview) {
+        preview.hidden = false;
+        preview.innerHTML = `<span style="color:var(--danger)">${escapeHtml(r.error || "Scan failed")}</span>`;
+      }
+      return;
+    }
+    renderProfilePreview(preview, r);
+    toast(`@${r.username} \u2014 ${formatNum(r.followers)} followers`);
   } catch (e) {
     clearToast(toastEl);
     if (preview) {
@@ -865,12 +922,20 @@ async function syncAccountProfile(accountId) {
   try {
     const r = await API.post(`/api/actions/sync-profile/${accountId}`);
     clearToast(toastEl);
-    toast(`@${r.profile?.username || accountId}: ${formatNum(r.profile?.followers)} followers`);
+    const p = r.profile || r;
+    if (p.private_account) {
+      toast(profileErrorToast(p, p.username), "error");
+    } else {
+      toast(`@${p.username || accountId}: ${formatNum(p.followers)} followers`);
+    }
     refreshAccounts();
     refreshStats();
   } catch (e) {
     clearToast(toastEl);
-    toast(e.message, "error");
+    const msg = e.profilePayload
+      ? profileErrorToast(e.profilePayload, e.profilePayload.username)
+      : e.message;
+    toast(msg, "error");
   } finally {
     setButtonLoading(btn, false);
   }
@@ -895,23 +960,361 @@ async function syncAllAccountProfiles() {
   }
 }
 
-async function runAction(action, accountId) {
-  if (action === "sync") {
-    return syncAccountProfile(accountId);
+function wsUrl(path) {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}${path}`;
+}
+
+function showLiveLogPanel(title, accountId) {
+  const panel = document.getElementById("liveLogPanel");
+  if (!panel) return;
+  panel.hidden = false;
+  document.getElementById("liveLogTitle").textContent = title;
+  document.getElementById("liveLogAccount").textContent = accountId
+    ? `Account #${accountId}`
+    : "";
+  document.getElementById("liveLogBody").innerHTML = "";
+  document.getElementById("liveLogFoot").textContent = "Connecting…";
+  document.getElementById("liveProgressBar").style.width = "0%";
+}
+
+function hideLiveLogPanel() {
+  if (liveWs) {
+    liveWs.close();
+    liveWs = null;
   }
+  const panel = document.getElementById("liveLogPanel");
+  if (panel) panel.hidden = true;
+}
+
+function appendLiveLog(line, cls = "") {
+  const body = document.getElementById("liveLogBody");
+  if (!body) return;
+  const el = document.createElement("div");
+  el.className = `live-log-line ${cls}`;
+  el.textContent = line;
+  body.appendChild(el);
+  body.scrollTop = body.scrollHeight;
+}
+
+function handleLiveEvent(ev) {
+  const t = ev.type || "";
+  const d = ev.data || {};
+  if (t === "farm:ping" || t === "post:ping") return;
+
+  if (t === "farm:start" || t === "post:start") {
+    liveSessionMeta.duration = d.duration || liveSessionMeta.duration || 15;
+    appendLiveLog(`▶ ${t}`, "ok");
+    return;
+  }
+  if (t === "farm:log" || t === "post:log") {
+    appendLiveLog(d.message || JSON.stringify(d));
+    return;
+  }
+  if (t === "farm:progress") {
+    const pct = liveSessionMeta.duration
+      ? Math.min(100, Math.round(((d.elapsed_sec || 0) / (liveSessionMeta.duration * 60)) * 100))
+      : 0;
+    document.getElementById("liveProgressBar").style.width = `${pct}%`;
+    appendLiveLog(`⏱ ${d.elapsed_sec || 0}s · scrolls ${d.scrolls || 0} · videos ${d.videos_seen || 0}`);
+    return;
+  }
+  if (t === "farm:action" || t === "post:action") {
+    appendLiveLog(`${d.action || "action"}: ${d.status || "?"}`);
+    return;
+  }
+  if (t === "farm:error" || t === "post:error") {
+    appendLiveLog(`✗ ${d.message || "Error"}`, "error");
+    document.getElementById("liveLogFoot").textContent = "Error";
+    return;
+  }
+  if (t === "farm:complete") {
+    const stats = d.stats || {};
+    document.getElementById("liveProgressBar").style.width = "100%";
+    document.getElementById("liveLogFoot").textContent = d.success
+      ? `Done · ${d.duration || 0}s · likes ${stats.likes || 0}`
+      : "Session failed";
+    appendLiveLog(`✓ Farm complete (${d.duration || 0}s)`, d.success ? "ok" : "error");
+    setTimeout(refreshAll, 1500);
+    return;
+  }
+  if (t === "post:complete") {
+    document.getElementById("liveProgressBar").style.width = "100%";
+    const ok = d.success;
+    document.getElementById("liveLogFoot").textContent = ok ? "Posted" : "Post failed";
+    appendLiveLog(ok ? "✓ Post uploaded" : "✗ Post failed", ok ? "ok" : "error");
+    setTimeout(refreshPosts, 1500);
+    return;
+  }
+  appendLiveLog(`${t} ${JSON.stringify(d)}`);
+}
+
+function connectLiveWs(sessionId, meta = {}) {
+  if (liveWs) liveWs.close();
+  liveSessionMeta = { ...liveSessionMeta, ...meta };
+  const url = wsUrl(`/api/ws/${sessionId}`);
+  liveWs = new WebSocket(url);
+  liveWs.onopen = () => {
+    document.getElementById("liveLogFoot").textContent = "Connected";
+    appendLiveLog("WebSocket connected", "ok");
+  };
+  liveWs.onmessage = (msg) => {
+    try {
+      handleLiveEvent(JSON.parse(msg.data));
+    } catch {
+      appendLiveLog(msg.data);
+    }
+  };
+  liveWs.onerror = () => {
+    document.getElementById("liveLogFoot").textContent = "Connection error";
+  };
+  liveWs.onclose = () => {
+    liveWs = null;
+  };
+}
+
+async function runFarmAction(accountId) {
+  const btn = document.querySelector(`[data-action="farm"][data-id="${accountId}"]`);
+  setButtonLoading(btn, true);
+  const toastEl = toast(`Starting farm for account ${accountId}…`, "loading");
+  try {
+    const result = await API.post(`/api/actions/farm/${accountId}`);
+    clearToast(toastEl);
+    if (result.session_id) {
+      showLiveLogPanel("Farm session", accountId);
+      connectLiveWs(result.session_id, { type: "farm", accountId, duration: 15 });
+      toast(result.message || "Farm started — watch live log");
+    } else {
+      toast(result.message || "Farm started");
+    }
+  } catch (e) {
+    clearToast(toastEl);
+    toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
+  }
+}
+
+async function quickPost(accountId) {
+  const acc = accountsCache.find((a) => a.id === accountId);
+  const toastEl = toast(`Quick post for @${acc?.username || accountId}…`, "loading");
+  try {
+    const result = await API.postJson(`/api/actions/post/${accountId}`, {
+      caption: "Check this out! 🔥",
+      hashtags: "fyp foryou viral",
+    });
+    clearToast(toastEl);
+    if (result.session_id) {
+      showLiveLogPanel("Post upload", accountId);
+      connectLiveWs(result.session_id, { type: "post", accountId });
+      toast("Post started — watch live log");
+    } else {
+      toast(result.message || "Post completed");
+      refreshPosts();
+    }
+  } catch (e) {
+    clearToast(toastEl);
+    toast(e.message, "error");
+  }
+}
+
+async function runAction(action, accountId) {
+  if (action === "sync") return syncAccountProfile(accountId);
+  if (action === "farm") return runFarmAction(accountId);
+
   const btn = document.querySelector(`[data-action="${action}"][data-id="${accountId}"]`);
   setButtonLoading(btn, true);
-  const paths = {
-    farm: `/api/actions/farm/${accountId}`,
-    post: `/api/actions/post/${accountId}`,
-    check: `/api/actions/check/${accountId}`,
-  };
-  const toastEl = toast(`Starting ${action} for account ${accountId}\u2026`, "loading");
+  const paths = { check: `/api/actions/check/${accountId}` };
+  const toastEl = toast(`Starting ${action} for account ${accountId}…`, "loading");
   try {
     const result = await API.post(paths[action]);
     clearToast(toastEl);
     toast(result.message || `${action} completed`);
     setTimeout(refreshAll, 2000);
+  } catch (e) {
+    clearToast(toastEl);
+    toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
+  }
+}
+
+async function refreshPosts() {
+  const wrap = document.getElementById("postsTable");
+  if (!wrap) return;
+  const filterEl = document.getElementById("postsFilterAccount");
+  const accountId = filterEl?.value ? parseInt(filterEl.value, 10) : null;
+  const q = accountId ? `?account_id=${accountId}&limit=50` : "?limit=50";
+  try {
+    const data = await API.get(`/api/posts${q}`);
+    postsCache = data.posts || [];
+    renderPostsTable();
+    const badge = document.getElementById("navBadgePosts");
+    if (badge) badge.textContent = String(postsCache.length);
+    populatePostsFilter();
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function populatePostsFilter() {
+  const sel = document.getElementById("postsFilterAccount");
+  if (!sel || sel.dataset.filled === "1") return;
+  sel.dataset.filled = "1";
+  accountsCache.forEach((a) => {
+    const opt = document.createElement("option");
+    opt.value = String(a.id);
+    opt.textContent = `@${a.username}`;
+    sel.appendChild(opt);
+  });
+}
+
+function renderPostsTable() {
+  const wrap = document.getElementById("postsTable");
+  if (!wrap) return;
+  if (!postsCache.length) {
+    wrap.innerHTML = `<div class="empty-state">No posts yet — use Compose or Quick Post on an account</div>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>Account</th>
+          <th>Status</th>
+          <th>Caption</th>
+          <th>Views</th>
+          <th>Posted</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${postsCache
+          .map(
+            (p) => `
+          <tr>
+            <td>@${escapeHtml(p.username || p.account_id)}</td>
+            <td><span class="badge ${p.status === "posted" ? "badge-active" : "badge-pending"}">${escapeHtml(p.status || "pending")}</span></td>
+            <td style="max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(p.caption || "")}">${escapeHtml((p.caption || "").slice(0, 60))}</td>
+            <td style="font-family:var(--font-mono)">${formatNum(p.views || 0)}</td>
+            <td style="font-size:0.8rem;color:var(--text-muted)">${formatDate(p.posted_at || p.scheduled_at)}</td>
+          </tr>`
+          )
+          .join("")}
+      </tbody>
+    </table>`;
+}
+
+async function loadPostTemplates() {
+  try {
+    const data = await API.get("/api/post-templates");
+    const sel = document.getElementById("postTemplate");
+    if (!sel || !data.templates?.length) return;
+    sel.innerHTML = data.templates
+      .map((t) => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`)
+      .join("");
+  } catch {
+    /* optional */
+  }
+}
+
+function openPostComposer(accountId) {
+  const acc = accountsCache.find((a) => a.id === accountId);
+  document.getElementById("postComposerAccountId").value = String(accountId);
+  document.getElementById("postComposerTitle").textContent = `Compose — @${acc?.username || accountId}`;
+  document.getElementById("postCaption").value = "";
+  document.getElementById("postHashtags").value = "fyp foryou viral";
+  document.getElementById("postAffiliateLink").value = "";
+  document.getElementById("postImagesDir").value = "";
+  document.getElementById("postPreviewStrip").innerHTML =
+    '<p class="form-hint">Click Generate to preview slideshow slides</p>';
+  document.querySelector('input[name="postType"][value="slideshow"]').checked = true;
+  document.getElementById("postVideoPathRow").hidden = true;
+  loadPostTemplates();
+  openModal("modalPostComposer");
+}
+
+async function generatePostPreview() {
+  const accountId = parseInt(document.getElementById("postComposerAccountId").value, 10);
+  const body = {
+    caption: document.getElementById("postCaption").value,
+    hashtags: document.getElementById("postHashtags").value,
+    affiliate_link: document.getElementById("postAffiliateLink").value,
+    template_name: document.getElementById("postTemplate").value,
+  };
+  const btn = document.getElementById("btnPostGenerate");
+  setButtonLoading(btn, true);
+  const toastEl = toast("Generating preview…", "loading");
+  try {
+    const r = await API.postJson(`/api/actions/preview/${accountId}`, body);
+    clearToast(toastEl);
+    document.getElementById("postImagesDir").value = r.images_dir || "";
+    if (r.caption_preview) document.getElementById("postCaption").value = r.caption_preview.split("\n\n")[0];
+    const strip = document.getElementById("postPreviewStrip");
+    strip.innerHTML = (r.images || [])
+      .map((url) => `<img src="${url}" alt="slide" loading="lazy">`)
+      .join("") || '<p class="form-hint">No images generated</p>';
+    toast("Preview ready");
+  } catch (e) {
+    clearToast(toastEl);
+    toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
+  }
+}
+
+async function submitPostComposer() {
+  const accountId = parseInt(document.getElementById("postComposerAccountId").value, 10);
+  const isVideo = document.querySelector('input[name="postType"]:checked')?.value === "video";
+  const btn = document.getElementById("btnPostSubmit");
+  setButtonLoading(btn, true);
+  closeModal("modalPostComposer");
+
+  if (isVideo) {
+    const videoPath = document.getElementById("postVideoPath").value.trim();
+    if (!videoPath) {
+      toast("Video path required", "error");
+      setButtonLoading(btn, false);
+      return;
+    }
+    const toastEl = toast("Uploading video…", "loading");
+    try {
+      const r = await API.postJson(`/api/actions/upload/video/${accountId}`, {
+        video_path: videoPath,
+        caption: document.getElementById("postCaption").value,
+        hashtags: document.getElementById("postHashtags").value,
+        affiliate_link: document.getElementById("postAffiliateLink").value,
+      });
+      clearToast(toastEl);
+      toast(r.success ? "Video posted" : (r.result?.error || "Upload failed"), r.success ? "success" : "error");
+      refreshPosts();
+    } catch (e) {
+      clearToast(toastEl);
+      toast(e.message, "error");
+    } finally {
+      setButtonLoading(btn, false);
+    }
+    return;
+  }
+
+  const body = {
+    caption: document.getElementById("postCaption").value,
+    hashtags: document.getElementById("postHashtags").value,
+    affiliate_link: document.getElementById("postAffiliateLink").value,
+    template_name: document.getElementById("postTemplate").value,
+    images_dir: document.getElementById("postImagesDir").value,
+  };
+  const toastEl = toast("Posting slideshow…", "loading");
+  try {
+    const r = await API.postJson(`/api/actions/post/${accountId}`, body);
+    clearToast(toastEl);
+    if (r.session_id) {
+      showLiveLogPanel("Post upload", accountId);
+      connectLiveWs(r.session_id, { type: "post", accountId });
+      toast("Post started");
+    } else {
+      toast(r.message || "Done");
+      refreshPosts();
+    }
   } catch (e) {
     clearToast(toastEl);
     toast(e.message, "error");
@@ -1040,85 +1443,55 @@ async function refreshSettings() {
   const wrap = document.getElementById("settingsPanel");
   if (!wrap) return;
   try {
-    const r = await API.get("/api/settings/tiktok-api");
-    if (!r.success) {
-      wrap.innerHTML = `<div class="empty-state">Failed to load settings</div>`;
-      return;
-    }
-    const s = r.settings;
+    const r = await API.get("/api/profile/status");
+    const s = r.status || {};
+    const ready = s.ready;
     wrap.innerHTML = `
       <div class="settings-card">
-        <h4><i data-lucide="radio" style="width:16px;height:16px"></i> TikTok API</h4>
+        <h4><i data-lucide="scan" style="width:16px;height:16px"></i> Profile Scanner</h4>
         <div class="status-line">
-          Status: ${s.ready ? '<span class="status-dot-sm ok"></span>Ready' : s.installed ? '<span class="status-dot-sm warn"></span>Not configured' : '<span class="status-dot-sm err"></span>TikTokApi not installed'}
+          Status: ${ready ? '<span class="status-dot-sm ok"></span>Ready' : '<span class="status-dot-sm err"></span>Not ready'}
+          &middot; Browser: <code>${escapeHtml(s.engine || "Chromium")}</code>
+          ${s.headless === false ? " &middot; headed" : " &middot; headless"}
         </div>
         <div class="status-line">
-          Library: ${s.installed ? '<code>installed</code>' : '<code>not installed</code>'}
-          ${s.ms_token ? '&middot; <code>ms_token set</code>' : '&middot; <code>no ms_token</code>'}
-          ${s.browser ? '&middot; Browser: ' + s.browser : ''}
+          ${escapeHtml(s.message || "Uses Playwright to read public TikTok profiles — no ms_token required.")}
         </div>
-        <div class="field-row">
-          <input id="settingsMsToken" type="password" placeholder="Paste ms_token here" value="${s.ms_token ? '********' : ''}">
-          <button class="btn btn-sm" type="button" id="btnSaveToken">Save</button>
-          <button class="btn btn-sm" type="button" id="btnTestApi">Test</button>
+        <div class="field-row" style="margin-top:0.75rem">
+          <button class="btn btn-sm btn-primary" type="button" id="btnTestProfileScan">
+            <i data-lucide="play"></i> Test Scan @tiktok
+          </button>
         </div>
         <div id="settingsResult" style="margin-top:0.5rem"></div>
       </div>
       <div class="settings-card">
-        <h4><i data-lucide="info" style="width:16px;height:16px"></i> How to get ms_token</h4>
+        <h4><i data-lucide="info" style="width:16px;height:16px"></i> How it works</h4>
         <div style="font-size:0.8rem;color:var(--text-muted);line-height:1.6">
-          1. Log into TikTok on Chrome/Firefox<br>
-          2. Open DevTools (F12) &rarr; Application tab &rarr; Cookies &rarr; tiktok.com<br>
-          3. Find <code>ms_token</code>, copy its value<br>
-          4. Paste above and click Save, then Test
+          Opens <code>https://www.tiktok.com/@username</code> in Chromium and reads followers, following, and likes from the page.
+          Assign a proxy on the account row if your server IP is blocked.
         </div>
       </div>`;
 
     if (typeof lucide !== "undefined") lucide.createIcons();
-
-    document.getElementById("btnSaveToken")?.addEventListener("click", saveMsToken);
-    document.getElementById("btnTestApi")?.addEventListener("click", testTikTokApi);
+    document.getElementById("btnTestProfileScan")?.addEventListener("click", testProfileScan);
   } catch (e) {
     wrap.innerHTML = `<div class="empty-state">Error: ${escapeHtml(e.message)}</div>`;
   }
 }
 
-async function saveMsToken() {
-  const input = document.getElementById("settingsMsToken");
-  const token = input?.value?.trim();
+async function testProfileScan() {
   const result = document.getElementById("settingsResult");
-  if (!token || token === "********") {
-    result.innerHTML = '<span style="color:var(--warning)">Paste the ms_token value first</span>';
-    return;
-  }
-  const btn = document.getElementById("btnSaveToken");
+  result.innerHTML = '<span style="color:var(--text-muted)">Scanning @tiktok…</span>';
+  const btn = document.getElementById("btnTestProfileScan");
   setButtonLoading(btn, true);
   try {
-    const r = await API.postJson("/api/settings/tiktok-api/token", { ms_token: token });
-    result.innerHTML = `<span style="color:var(--success)">${escapeHtml(r.message)}</span>`;
-    toast(r.message);
-    refreshSettings();
-  } catch (e) {
-    result.innerHTML = `<span style="color:var(--danger)">${escapeHtml(e.message)}</span>`;
-    toast(e.message, "error");
-  } finally {
-    setButtonLoading(btn, false);
-  }
-}
-
-async function testTikTokApi() {
-  const result = document.getElementById("settingsResult");
-  result.innerHTML = '<span style="color:var(--text-muted)">Testing connection...</span>';
-  const btn = document.getElementById("btnTestApi");
-  setButtonLoading(btn, true);
-  try {
-    const r = await API.post("/api/settings/tiktok-api/test");
+    const r = await API.post("/api/profile/scan/tiktok");
     if (r.success) {
-      result.innerHTML = `<span style="color:var(--success)">${escapeHtml(r.message)}</span>`;
-      toast("TikTok API connected");
+      result.innerHTML = `<span style="color:var(--success)">OK — @${escapeHtml(r.username)}: ${formatNum(r.followers)} followers, ${formatNum(r.likes)} likes</span>`;
+      toast(`Scanner OK — ${formatNum(r.followers)} followers`);
     } else {
-      result.innerHTML = `<span style="color:var(--warning)">${escapeHtml(r.message)}</span>`;
-      toast(r.message, "error");
+      result.innerHTML = `<span style="color:var(--warning)">${escapeHtml(profileErrorToast(r, "tiktok"))}</span>`;
+      toast(profileErrorToast(r, "tiktok"), "error");
     }
   } catch (e) {
     result.innerHTML = `<span style="color:var(--danger)">${escapeHtml(e.message)}</span>`;
@@ -1164,6 +1537,7 @@ function initNav() {
       const id = link.getAttribute("data-section");
       document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });
       setActiveNav(id);
+      if (id === "posts") refreshPosts();
       closeMobileSidebar();
     });
   });
@@ -1396,18 +1770,22 @@ function initModals() {
   document.getElementById("btnSyncAllProfiles")?.addEventListener("click", syncAllAccountProfiles);
 
   // Action buttons (Farm, Post, Sync, Check, Del) — event delegation
-  document.getElementById("accountsBody")?.addEventListener("click", (e) => {
-    const btn = e.target.closest("[data-action]");
-    if (!btn) return;
-    e.preventDefault();
-    const action = btn.dataset.action;
-    const id = parseInt(btn.dataset.id);
-    if (action === "delete") {
-      deleteAccount(id);
-    } else {
-      runAction(action, id);
-    }
+  document.addEventListener("click", () => {
+    document.querySelectorAll(".actions-dropdown.open").forEach((d) => d.classList.remove("open"));
   });
+
+  document.getElementById("liveLogClose")?.addEventListener("click", hideLiveLogPanel);
+  document.getElementById("btnPostGenerate")?.addEventListener("click", generatePostPreview);
+  document.getElementById("btnPostSubmit")?.addEventListener("click", submitPostComposer);
+  document.getElementById("btnRefreshPosts")?.addEventListener("click", refreshPosts);
+  document.getElementById("postsFilterAccount")?.addEventListener("change", refreshPosts);
+  document.querySelectorAll('input[name="postType"]').forEach((el) => {
+    el.addEventListener("change", () => {
+      const video = document.querySelector('input[name="postType"]:checked')?.value === "video";
+      document.getElementById("postVideoPathRow").hidden = !video;
+    });
+  });
+
   document.getElementById("accountsBody")?.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-delete-proxy]");
     if (!btn) return;

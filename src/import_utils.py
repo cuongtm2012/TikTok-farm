@@ -21,38 +21,10 @@ PROXY_CSV_TEMPLATE = """ip,port,protocol,username,password,status
 
 
 def parse_cookie_string(cookie_str: str) -> List[Dict[str, Any]]:
-    """'name=value; name=value' → Playwright cookie objects."""
-    cookies = []
-    if not cookie_str or not str(cookie_str).strip():
-        return cookies
+    """'name=value; name=value' → Playwright cookie objects (via CookieManager)."""
+    from src.cookie_manager import CookieManager
 
-    text = str(cookie_str).strip()
-    if text.startswith("["):
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, list):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    for part in text.split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        name = name.strip()
-        if not name:
-            continue
-        cookies.append({
-            "name": name,
-            "value": value.strip(),
-            "domain": ".tiktok.com",
-            "path": "/",
-            "httpOnly": False,
-            "secure": True,
-            "sameSite": "Lax",
-        })
-    return cookies
+    return CookieManager.parse_cookie_string(cookie_str)
 
 
 def parse_seller_line(line: str) -> Dict[str, Any]:

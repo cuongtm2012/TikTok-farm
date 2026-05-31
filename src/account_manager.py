@@ -235,22 +235,10 @@ class AccountManager:
         Parse cookie string or JSON/list and save to DB.
         Returns (success, cookies_list).
         """
-        from src.import_utils import parse_cookie_string
+        from src.cookie_manager import CookieManager
 
-        cookies: list = []
-        if isinstance(cookie_input, list):
-            cookies = cookie_input
-        elif isinstance(cookie_input, str) and cookie_input.strip():
-            text = cookie_input.strip()
-            if text.startswith("["):
-                try:
-                    parsed = json.loads(text)
-                    if isinstance(parsed, list):
-                        cookies = parsed
-                except json.JSONDecodeError:
-                    cookies = parse_cookie_string(text)
-            else:
-                cookies = parse_cookie_string(text)
+        cookies = CookieManager.cookies_from_account_data(cookie_input)
+        cookies = CookieManager.to_playwright_format(cookies)
 
         if not cookies:
             return False, []
@@ -491,12 +479,19 @@ class AccountManager:
             return []
 
     def apply_tiktok_profile(self, account_id: int, profile: Dict) -> Optional[Account]:
-        """Update account stats from normalized TikTok public profile."""
+        """Update account stats from browser scanner or legacy TikTok-Api shape."""
+        total_posts = profile.get("total_posts")
+        if total_posts is None:
+            total_posts = profile.get("video_count", 0)
+        total_views = profile.get("likes")
+        if total_views is None:
+            total_views = profile.get("heart_count", 0)
         return self.update_account(
             account_id,
             followers=profile.get("followers", 0),
             following=profile.get("following", 0),
-            total_posts=profile.get("video_count", 0),
+            total_posts=total_posts,
+            total_views=int(total_views or 0),
             last_active=datetime.now().isoformat(),
         )
 
@@ -830,6 +825,57 @@ class AccountManager:
         except Exception as e:
             logger.error(f"Failed to update post {post_id}: {e}")
             return False
+
+    def get_post(self, post_id: int) -> Optional[Dict]:
+        """Get a single post record by id."""
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                self.db.sql(
+                    "SELECT p.*, a.username as account_username "
+                    "FROM posts p LEFT JOIN accounts a ON p.account_id = a.id "
+                    "WHERE p.id = ?"
+                ),
+                (post_id,),
+            )
+            row = cursor.fetchone()
+            conn.close()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Failed to get post {post_id}: {e}")
+            return None
+
+    def list_posts(
+        self,
+        account_id: Optional[int] = None,
+        limit: int = 50,
+        status: Optional[str] = None,
+    ) -> List[Dict]:
+        """List post records with account username."""
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            sql = (
+                "SELECT p.*, a.username as account_username "
+                "FROM posts p LEFT JOIN accounts a ON p.account_id = a.id WHERE 1=1"
+            )
+            params: list = []
+            if account_id is not None:
+                sql += " AND p.account_id = ?"
+                params.append(account_id)
+            if status:
+                sql += " AND p.status = ?"
+                params.append(status)
+            sql += " ORDER BY p.id DESC LIMIT ?"
+            params.append(limit)
+            cursor.execute(self.db.sql(sql), tuple(params))
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"Failed to list posts: {e}")
+            return []
 
     def get_pending_posts(self, limit: int = 10) -> List[Dict]:
         """Get posts scheduled for posting."""

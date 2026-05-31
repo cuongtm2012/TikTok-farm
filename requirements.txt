@@ -31,7 +31,7 @@ tenacity>=8.2.0
 
 # TikTok public profile (optional)
 # https://github.com/davidteather/TikTok-Api
-TikTokApi>=7.3.0
+# TikTok public profiles: browser-based scanner (src/profile_scanner.py), no TikTokApi
 
 # Redis (APScheduler job store when redis.enabled=true)
 redis>=5.0.0

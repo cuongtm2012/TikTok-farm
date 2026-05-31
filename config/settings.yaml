@@ -32,6 +32,15 @@ camoufox:
   navigation_timeout: 60000
   use_camoufox: false
 
+profile_scanner:
+  enabled: true
+  scan_timeout_ms: 15000
+  min_interval_sec: 1.0
+
+post_engine:
+  upload_timeout_ms: 200000
+  max_retries: 2
+
 health_check:
   interval_minutes: 30
   alert_on_shadowban: true

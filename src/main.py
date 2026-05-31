@@ -31,13 +31,15 @@ from src.account_manager import AccountManager
 from src.session_service import SessionService
 from src.warmup_manager import WarmupManager
 from src.browser_manager import BrowserManager
+from src.event_bus import FarmEventBus
 from src.farm_engine import FarmEngine
 from src.content_pipeline import ContentPipeline
 from src.post_engine import PostEngine
 from src.scheduler import FarmScheduler
 from src.health_monitor import HealthMonitor
 from src.telegram_alert import TelegramAlert
-from src.tiktok_profile import TikTokProfileService
+from src.profile_scanner import ProfileScanner
+from src.cookie_manager import CookieManager
 from src.affiliate import AffiliatePipeline
 
 # Setup logging
@@ -102,9 +104,21 @@ class AppState:
         self.proxy_manager = ProxyManager.from_settings(settings)
         self.account_manager = AccountManager(db=self.db)
         self.browser_manager = BrowserManager.from_settings(settings)
-        self.farm_engine = FarmEngine(self.browser_manager, account_manager=self.account_manager)
+        self.event_bus = FarmEventBus.get_instance()
+        self.farm_engine = FarmEngine(
+            self.browser_manager,
+            account_manager=self.account_manager,
+            event_bus=self.event_bus,
+        )
+        self.active_farm_tasks: dict = {}
+        self.active_post_tasks: dict = {}
         self.content_pipeline = ContentPipeline.from_settings(settings)
-        self.post_engine = PostEngine(self.browser_manager, self.account_manager)
+        self.cookie_manager = CookieManager()
+        self.post_engine = PostEngine(
+            self.browser_manager,
+            self.account_manager,
+            cookie_manager=self.cookie_manager,
+        )
         self.session_service = SessionService(self.account_manager, self.proxy_manager)
         self.warmup_manager = WarmupManager(
             self.account_manager, self.proxy_manager, settings
@@ -126,7 +140,7 @@ class AppState:
             warmup_manager=self.warmup_manager,
             affiliate_pipeline=self.affiliate_pipeline,
         )
-        self.tiktok_profile = TikTokProfileService(settings)
+        self.profile_scanner = ProfileScanner(self.browser_manager)
 
         self.proxy_manager.load_from_csv()
         logger.info("All components initialized")
@@ -144,23 +158,12 @@ class AppState:
         # Start browser heartbeat to detect crashes early
         await self.browser_manager.start_heartbeat(interval_seconds=60)
 
-        # Warm up TikTok API sessions
+        # Warm up browser for profile scanner
         try:
-            if self.tiktok_profile and self.tiktok_profile.is_ready():
-                logger.info("Warming up TikTok API sessions...")
-                from TikTokApi import TikTokApi
-                api = TikTokApi()
-                await api.create_sessions(
-                    ms_tokens=[self.tiktok_profile.ms_token],
-                    num_sessions=2,
-                    sleep_after=8,
-                    browser=self.tiktok_profile.browser,
-                )
-                await api.close_sessions()
-                await api.stop_playwright()
-                logger.info("TikTok sessions warmed up on startup")
+            await self.browser_manager._ensure_playwright()
+            logger.info("Browser ready for profile scanner")
         except Exception as e:
-            logger.warning(f"TikTok session warmup failed (non-fatal): {e}")
+            logger.warning(f"Browser warmup failed (non-fatal): {e}")
 
         self.scheduler.start()
 

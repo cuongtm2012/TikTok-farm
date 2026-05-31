@@ -1,0 +1,34 @@
+# TikTok upload UI selectors (from tiktok-uploader config.toml pattern)
+upload:
+  upload_page: "https://www.tiktok.com/creator-center/upload?lang=en"
+  file_input: "//input[@type='file']"
+  upload_finished: "//div[contains(@class, 'btn-cancel')]"
+  split_window: "//button[./div[text()='Not now']]"
+  description: "//div[@contenteditable='true']"
+  mention_box: "//div[contains(@class, 'mention-list-popover')]"
+  comment_toggle: "//label[.='Comment']/following-sibling::div/input"
+  duet_toggle: "//label[.='Duet']/following-sibling::div/input"
+  stitch_toggle: "//label[.='Stitch']/following-sibling::div/input"
+  post_button: "//button[@data-e2e='post_video_button']"
+  post_confirmation: "//div[contains(text(), 'Your video has been uploaded') or contains(text(), 'Video published') or contains(text(), 'scheduled')]"
+  upload_timeout_ms: 200000
+
+cover:
+  edit_cover_button: "//div[contains(@class, 'edit-container')]"
+  upload_cover_tab: "//div[contains(text(), 'Upload cover')]"
+  upload_cover_input: "//input[@type='file' and @accept='image/png, image/jpeg, image/jpg']"
+  confirm_cover: "//div[not(contains(@class, 'hide-panel'))]/div[contains(@class, 'cover-edit-footer')]/button[contains(@class, 'TUXButton--primary')]"
+
+schedule:
+  switch: "//*[@id='tux-1']"
+  date_picker: "//div[contains(@class, 'date-picker-input')]"
+  calendar_month: "//span[contains(@class, 'month-title')]"
+  calendar_valid_days: "//div[@class='jsx-4172176419 days-wrapper']//span[contains(@class, 'day') and contains(@class, 'valid')]"
+  calendar_arrows: "//span[contains(@class, 'arrow')]"
+  time_picker: "//div[contains(@class, 'time-picker-input')]"
+  timepicker_hours: "//span[contains(@class, 'tiktok-timepicker-left')]"
+  timepicker_minutes: "//span[contains(@class, 'tiktok-timepicker-right')]"
+
+login_indicators:
+  login_url_fragment: "/login"
+  cookie_expired_text: "Log in to TikTok"

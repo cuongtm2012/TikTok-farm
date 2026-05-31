@@ -1,9 +1,13 @@
 # TikTok Farm - Web API Routes
 # FastAPI routes for dashboard and management
 
+import asyncio
 import json
 import logging
 import os
+import random
+import shutil
+import time
 from datetime import datetime
 from typing import Optional, List, Any
 from pathlib import Path
@@ -11,8 +15,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 try:
-    from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File, Body
-    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+    from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File, Body, WebSocket, WebSocketDisconnect
+    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, FileResponse
     from pydantic import BaseModel, Field
     FASTAPI_AVAILABLE = True
 except ImportError:
@@ -63,6 +67,31 @@ if FASTAPI_AVAILABLE:
         csv_text: str
         merge: bool = True
 
+    class PostComposeBody(BaseModel):
+        caption: str = ""
+        hashtags: str = "fyp foryou viral"
+        affiliate_link: str = ""
+        rating: Optional[float] = None
+        review: str = ""
+        price: str = ""
+        template_name: str = "default"
+        product_name: str = "Product"
+        images_dir: str = ""
+
+    class VideoUploadBody(BaseModel):
+        video_path: str
+        caption: str = ""
+        hashtags: str = "fyp foryou viral"
+        affiliate_link: str = ""
+
+    class PostCreateBody(BaseModel):
+        account_id: int
+        caption: str = ""
+        hashtags: str = "fyp foryou viral"
+        affiliate_link: str = ""
+        content_path: str = ""
+        scheduled_at: Optional[str] = None
+
 
 if FASTAPI_AVAILABLE:
     router = APIRouter()
@@ -73,6 +102,22 @@ else:
 def get_state(request: Request):
     """Get the app state from request."""
     return request.app.state.farm
+
+
+def _account_proxy_url(state, account) -> Optional[str]:
+    if not account or not account.proxy_id:
+        return None
+    proxy_obj = state.proxy_manager.get_proxy(account.proxy_id)
+    if proxy_obj and proxy_obj.is_alive:
+        return proxy_obj.url
+    return None
+
+
+PREVIEW_ROOT = Path("data/previews")
+
+
+def _emit_session(state, session_id: str, event_type: str, account_id: int, data: dict):
+    state.event_bus.emit(session_id, event_type, account_id=account_id, data=data)
 
 
 def _apply_cookies_to_account(state, account_id: int, cookie_input: Any) -> dict:
@@ -489,67 +534,127 @@ async def delete_account_cookies(request: Request, account_id: int):
     return {"success": True, "account": account.to_dict()}
 
 
-# ---- TikTok public profile (davidteather/TikTok-Api) ----
+# ---- Profile scanner (Playwright browser) ----
 
-@router.get("/tiktok/profile/status")
-async def tiktok_profile_status(request: Request):
-    """Whether TikTok-Api profile lookup is configured."""
+
+def _profile_proxy_url(state, proxy_id: int) -> Optional[str]:
+    if not proxy_id:
+        return None
+    proxy_obj = state.proxy_manager.get_proxy(proxy_id)
+    if proxy_obj and proxy_obj.is_alive:
+        return proxy_obj.url
+    return None
+
+
+def _apply_profile_scan_to_account(state, account_id: int, result: dict):
+    """Persist browser profile scan stats to account row (SPEC v3)."""
+    if not result.get("success") or result.get("private_account"):
+        return None
+    state.account_manager.update_account(
+        account_id,
+        followers=result.get("followers", 0),
+        following=result.get("following", 0),
+        total_posts=result.get("total_posts", 0),
+        total_views=result.get("likes", 0),
+        status="active",
+        last_active=datetime.now().isoformat(),
+    )
+    return state.account_manager.get_account(account_id)
+
+
+def _profile_scan_http_error(result: dict):
+    """Raise HTTPException with error_type for dashboard toasts."""
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": result.get("error") or "Profile scan failed",
+            "error_type": result.get("error_type"),
+            "username": result.get("username"),
+        },
+    )
+
+
+@router.get("/profile/status")
+async def profile_scanner_status(request: Request):
+    """Profile scanner readiness (browser-based, no ms_token)."""
     state = get_state(request)
-    return {"success": True, **state.tiktok_profile.status()}
+    return {"success": True, "status": state.profile_scanner.status()}
 
 
-@router.get("/tiktok/profile/{username}")
-async def tiktok_profile_lookup(request: Request, username: str):
-    """Fetch public TikTok profile by username (no DB write)."""
+@router.post("/profile/scan/{username}")
+async def profile_scan_username(request: Request, username: str):
+    """Scan public TikTok profile (no proxy)."""
     state = get_state(request)
-    try:
-        profile = await state.tiktok_profile.fetch_profile(username)
-        return {"success": True, "profile": profile}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"TikTok profile lookup failed for {username}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await state.profile_scanner.fetch_profile(username)
+    return result
+
+
+@router.post("/profile/scan/{username}/proxy/{proxy_id}")
+async def profile_scan_with_proxy(request: Request, username: str, proxy_id: int):
+    """Scan public TikTok profile using a specific proxy."""
+    state = get_state(request)
+    proxy_url = _profile_proxy_url(state, proxy_id)
+    if proxy_id and not proxy_url:
+        raise HTTPException(status_code=400, detail="Proxy not found or not alive")
+    result = await state.profile_scanner.fetch_profile(username, proxy_url=proxy_url)
+    return result
 
 
 @router.post("/accounts/{account_id}/sync-profile")
 async def sync_account_profile(request: Request, account_id: int):
-    """Fetch TikTok public stats and save to account row."""
+    """Fetch TikTok public stats via browser and save to account row."""
     state = get_state(request)
     account = state.account_manager.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
-    try:
-        profile = await state.tiktok_profile.fetch_profile(account.username)
-        updated = state.account_manager.apply_tiktok_profile(account_id, profile)
-        return {
-            "success": True,
-            "profile": profile,
-            "account": updated.to_dict() if updated else None,
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Profile sync failed for account {account_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+
+    proxy_url = _profile_proxy_url(state, account.proxy_id)
+    result = await state.profile_scanner.fetch_profile(account.username, proxy_url=proxy_url)
+    if not result.get("success"):
+        _profile_scan_http_error(result)
+    updated = _apply_profile_scan_to_account(state, account_id, result)
+    return {
+        "success": True,
+        "profile": result,
+        "account": updated.to_dict() if updated else None,
+    }
 
 
 @router.post("/accounts/sync-profiles")
 async def sync_all_account_profiles(request: Request):
-    """Sync public TikTok stats for all accounts (sequential, may be slow)."""
+    """Sync public TikTok stats for all accounts (sequential, rate-limited)."""
     state = get_state(request)
     accounts = state.account_manager.get_all_accounts()
     results = {"synced": 0, "failed": 0, "errors": []}
 
     for acc in accounts:
         try:
-            profile = await state.tiktok_profile.fetch_profile(acc.username)
-            state.account_manager.apply_tiktok_profile(acc.id, profile)
-            results["synced"] += 1
+            proxy_url = _profile_proxy_url(state, acc.proxy_id)
+            result = await state.profile_scanner.fetch_profile(acc.username, proxy_url=proxy_url)
+            if result.get("success") and not result.get("private_account"):
+                _apply_profile_scan_to_account(state, acc.id, result)
+                results["synced"] += 1
+            elif result.get("private_account"):
+                results["failed"] += 1
+                results["errors"].append(
+                    {
+                        "account_id": acc.id,
+                        "username": acc.username,
+                        "error": "private",
+                        "error_type": "private",
+                    }
+                )
+            else:
+                results["failed"] += 1
+                results["errors"].append(
+                    {
+                        "account_id": acc.id,
+                        "username": acc.username,
+                        "error": result.get("error", "scan failed"),
+                        "error_type": result.get("error_type"),
+                    }
+                )
+            await asyncio.sleep(1.5)
         except Exception as e:
             results["failed"] += 1
             results["errors"].append({"account_id": acc.id, "username": acc.username, "error": str(e)})
@@ -740,32 +845,39 @@ async def trigger_farm(
     account_id: int,
     duration: int = Query(15, description="Duration in minutes"),
 ):
-    """Trigger a farm session for an account."""
+    """Trigger a farm session for an account (background + WebSocket stream)."""
     state = get_state(request)
     try:
         account = state.account_manager.get_account(account_id)
         if not account:
             raise HTTPException(status_code=404, detail="Account not found")
 
-        proxy = None
-        if account.proxy_id:
-            proxy_obj = state.proxy_manager.get_proxy(account.proxy_id)
-            if proxy_obj and proxy_obj.is_alive:
-                proxy = proxy_obj.url
+        if state.farm_engine.is_running or account_id in state.active_farm_tasks:
+            raise HTTPException(status_code=409, detail="Farm session already running for this account")
 
-        # Run in background
-        import asyncio
-        task = asyncio.create_task(
-            state.farm_engine.run_farm_session(
-                account_id=account_id,
-                proxy_url=proxy,
-                duration_minutes=duration,
-            )
-        )
+        proxy = _account_proxy_url(state, account)
+        session_id = f"farm_{account_id}_{int(time.time())}"
+        state.event_bus.create_session(session_id)
+        state.active_farm_tasks[account_id] = session_id
+
+        async def _run_farm():
+            try:
+                await state.farm_engine.run_farm_session(
+                    account_id=account_id,
+                    proxy_url=proxy,
+                    duration_minutes=duration,
+                    session_id=session_id,
+                )
+            finally:
+                state.active_farm_tasks.pop(account_id, None)
+
+        task = asyncio.create_task(_run_farm())
 
         return {
             "success": True,
             "message": f"Farm session started for account {account_id} ({duration} min)",
+            "session_id": session_id,
+            "ws_url": f"/api/ws/{session_id}",
             "task_id": id(task),
         }
     except HTTPException:
@@ -775,43 +887,343 @@ async def trigger_farm(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.websocket("/ws/{session_id}")
+async def farm_websocket(websocket: WebSocket, session_id: str):
+    """Subscribe to live farm or post session events."""
+    await websocket.accept()
+    state = websocket.app.state.farm
+    if not state.event_bus.has_session(session_id):
+        state.event_bus.create_session(session_id)
+    try:
+        async for event in state.event_bus.subscribe(session_id):
+            await websocket.send_json(event)
+            if event.get("type") in ("farm:complete", "post:complete", "post:error"):
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(f"WebSocket {session_id} closed: {e}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@router.post("/posts")
+async def create_post_draft(request: Request, body: PostCreateBody = Body(...)):
+    """Create a pending post draft with optional schedule validation."""
+    from src.post_engine import validate_schedule, parse_schedule_at
+
+    state = get_state(request)
+    account = state.account_manager.get_account(body.account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    schedule_dt = parse_schedule_at(body.scheduled_at)
+    if schedule_dt:
+        ok, msg = validate_schedule(schedule_dt)
+        if not ok:
+            raise HTTPException(status_code=400, detail=msg)
+
+    post_id = state.account_manager.add_post(
+        body.account_id,
+        body.content_path or "",
+        body.caption,
+        body.hashtags,
+        body.affiliate_link,
+        scheduled_at=body.scheduled_at,
+    )
+    if not post_id:
+        raise HTTPException(status_code=500, detail="Failed to create post")
+
+    return {
+        "success": True,
+        "post_id": post_id,
+        "message": "Post draft created",
+        "scheduled_at": body.scheduled_at,
+    }
+
+
+@router.post("/posts/{post_id}/publish")
+async def publish_post(request: Request, post_id: int):
+    """Publish a draft post via PostEngine v4."""
+    from src.post_engine import parse_schedule_at, CookieExpiredError
+
+    state = get_state(request)
+    row = state.account_manager.get_post(post_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    account = state.account_manager.get_account(row["account_id"])
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    content_path = row.get("content_path") or ""
+    if not content_path:
+        raise HTTPException(status_code=400, detail="Post has no content_path")
+
+    proxy_url = _account_proxy_url(state, account)
+    schedule_dt = parse_schedule_at(row.get("scheduled_at"))
+    path = Path(content_path)
+
+    try:
+        if path.is_dir():
+            result = await state.post_engine.upload_slideshow(
+                account_id=account.id,
+                images_dir=str(path),
+                caption=row.get("caption") or "",
+                hashtags=row.get("hashtags") or "",
+                affiliate_link=row.get("affiliate_link") or "",
+                username=account.username,
+                password=account.password or "",
+                cookie_data=account.cookie_data,
+                proxy_url=proxy_url,
+                schedule_dt=schedule_dt,
+            )
+        else:
+            result = await state.post_engine.upload_video(
+                account_id=account.id,
+                video_path=str(path),
+                caption=row.get("caption") or "",
+                hashtags=row.get("hashtags") or "",
+                affiliate_link=row.get("affiliate_link") or "",
+                username=account.username,
+                password=account.password or "",
+                cookie_data=account.cookie_data,
+                proxy_url=proxy_url,
+                schedule_dt=schedule_dt,
+            )
+    except CookieExpiredError as e:
+        if state.telegram.enabled:
+            await state.telegram.send_alert(
+                "error",
+                f"Post {post_id} failed: cookies expired for @{account.username}",
+            )
+        raise HTTPException(status_code=401, detail=str(e))
+
+    if result.get("success"):
+        state.account_manager.mark_post_posted(
+            post_id,
+            tiktok_post_id=result.get("tiktok_post_id") or result.get("post_id"),
+            views=0,
+        )
+        acc = state.account_manager.get_account(account.id)
+        state.account_manager.update_account(
+            account.id,
+            total_posts=(acc.total_posts or 0) + 1,
+            last_active=datetime.now().isoformat(),
+        )
+    else:
+        state.account_manager.update_post(post_id, status="failed")
+        if state.telegram.enabled:
+            await state.telegram.send_alert(
+                "error",
+                f"Post {post_id} publish failed: {result.get('error', 'unknown')}",
+            )
+
+    return {"success": result.get("success", False), "result": result, "post_id": post_id}
+
+
+@router.get("/posts")
+async def list_posts(
+    request: Request,
+    account_id: Optional[int] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    status: Optional[str] = Query(None),
+):
+    """Post history for dashboard."""
+    state = get_state(request)
+    rows = state.account_manager.list_posts(account_id=account_id, limit=limit, status=status)
+    posts = []
+    for r in rows:
+        posts.append({
+            "id": r.get("id"),
+            "account_id": r.get("account_id"),
+            "username": r.get("account_username") or "",
+            "tiktok_post_id": r.get("tiktok_post_id"),
+            "media_type": "slideshow" if r.get("content_path") else "unknown",
+            "caption": r.get("caption") or "",
+            "hashtags": r.get("hashtags") or "",
+            "status": r.get("status") or "pending",
+            "views": r.get("views") or 0,
+            "likes": r.get("likes") or 0,
+            "comments": r.get("comments") or 0,
+            "shares": r.get("shares") or 0,
+            "scheduled_at": r.get("scheduled_at"),
+            "posted_at": r.get("posted_at"),
+            "content_path": r.get("content_path"),
+        })
+    return {"success": True, "count": len(posts), "posts": posts}
+
+
+@router.get("/post-templates")
+async def get_post_templates(request: Request):
+    """List content pipeline template names."""
+    state = get_state(request)
+    templates = list((state.content_pipeline.templates or {}).keys())
+    return {"success": True, "templates": templates}
+
+
+@router.get("/preview/{preview_id}/{filename}")
+async def serve_preview_image(preview_id: str, filename: str):
+    """Serve generated preview slide images."""
+    if ".." in preview_id or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid path")
+    path = PREVIEW_ROOT / preview_id / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Preview not found")
+    return FileResponse(path)
+
+
+@router.post("/actions/preview/{account_id}")
+async def preview_post(request: Request, account_id: int, body: PostComposeBody = Body(default_factory=PostComposeBody)):
+    """Generate slideshow preview without uploading."""
+    state = get_state(request)
+    account = state.account_manager.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    rating = body.rating if body.rating is not None else round(random.uniform(3.5, 5.0), 1)
+    review = body.review or random.choice([
+        "Amazing quality! Highly recommend.",
+        "Best purchase this year!",
+        "Perfect for daily use.",
+        "Exceeded expectations!",
+        "Fast shipping, great product!",
+    ])
+    price = body.price or f"${random.randint(9, 99)}.{random.randint(0, 99):02d}"
+
+    post_dir = await state.content_pipeline.generate_post(
+        account_id=account_id,
+        product_name=body.product_name,
+        template_name=body.template_name,
+        rating=rating,
+        review=review,
+        price=price,
+    )
+    if not post_dir:
+        raise HTTPException(status_code=500, detail="Content generation failed")
+
+    preview_id = f"preview_{account_id}_{int(time.time())}"
+    dest = PREVIEW_ROOT / preview_id
+    dest.mkdir(parents=True, exist_ok=True)
+    src = Path(post_dir)
+    images = sorted(src.glob("*.png")) + sorted(src.glob("*.jpg"))
+    urls = []
+    for i, img in enumerate(images[:10], start=1):
+        name = f"slide_{i}{img.suffix}"
+        shutil.copy2(img, dest / name)
+        urls.append(f"/api/preview/{preview_id}/{name}")
+
+    caption = body.caption or review
+    tags = body.hashtags or "fyp foryou viral"
+    caption_preview = f"{caption}\n\n{' '.join('#' + t.lstrip('#') for t in tags.split())}"
+
+    return {
+        "success": True,
+        "preview_id": preview_id,
+        "images": urls,
+        "images_dir": str(src),
+        "caption_preview": caption_preview,
+        "rating": rating,
+        "price": price,
+    }
+
+
+async def _run_post_upload(state, account_id: int, body: PostComposeBody, session_id: str):
+    account = state.account_manager.get_account(account_id)
+    if not account:
+        _emit_session(state, session_id, "post:error", account_id, {"message": "Account not found"})
+        return
+
+    try:
+        _emit_session(state, session_id, "post:start", account_id, {"type": "slideshow"})
+        proxy = _account_proxy_url(state, account)
+
+        images_dir = body.images_dir
+        if not images_dir:
+            _emit_session(state, session_id, "post:log", account_id, {"message": "Generating slideshow..."})
+            rating = body.rating if body.rating is not None else round(random.uniform(3.5, 5.0), 1)
+            images_dir = await state.content_pipeline.generate_post(
+                account_id=account_id,
+                product_name=body.product_name,
+                template_name=body.template_name,
+                rating=rating,
+                review=body.review or "Great product!",
+                price=body.price or "$29.99",
+            )
+        if not images_dir:
+            _emit_session(state, session_id, "post:error", account_id, {"message": "Content generation failed"})
+            return
+
+        caption = body.caption or "Check this out! 🔥"
+        hashtags = body.hashtags or "fyp foryou viral"
+        post_id = state.account_manager.add_post(
+            account_id, images_dir, caption, hashtags, body.affiliate_link
+        )
+
+        _emit_session(state, session_id, "post:log", account_id, {"message": "Uploading to TikTok..."})
+        result = await state.post_engine.upload_slideshow(
+            account_id=account_id,
+            images_dir=images_dir,
+            caption=caption,
+            hashtags=hashtags,
+            affiliate_link=body.affiliate_link,
+            username=account.username,
+            password=account.password or "",
+            cookie_data=account.cookie_data,
+            proxy_url=proxy,
+        )
+        if post_id and result.get("success"):
+            state.account_manager.mark_post_posted(
+                post_id, tiktok_post_id=result.get("post_id"), views=0
+            )
+        _emit_session(
+            state,
+            session_id,
+            "post:complete",
+            account_id,
+            {"success": result.get("success", False), "result": result, "post_id": post_id},
+        )
+    except Exception as e:
+        logger.error(f"Post upload error for {account_id}: {e}", exc_info=True)
+        _emit_session(state, session_id, "post:error", account_id, {"message": str(e)})
+    finally:
+        state.active_post_tasks.pop(account_id, None)
+
+
 @router.post("/actions/post/{account_id}")
-async def trigger_post(request: Request, account_id: int):
-    """Trigger a post upload for an account."""
+async def trigger_post(
+    request: Request,
+    account_id: int,
+    body: PostComposeBody = Body(default_factory=PostComposeBody),
+    background: bool = Query(True, description="Run in background with WebSocket progress"),
+):
+    """Generate slideshow content and upload to TikTok."""
     state = get_state(request)
     try:
         account = state.account_manager.get_account(account_id)
         if not account:
             raise HTTPException(status_code=404, detail="Account not found")
 
-        # Generate content
-        import random
-        post_dir = await state.content_pipeline.generate_post(
-            account_id=account_id,
-            rating=round(random.uniform(3.5, 5.0), 1),
-            review=random.choice([
-                "Amazing quality! Highly recommend.",
-                "Best purchase this year!",
-                "Perfect for daily use.",
-                "Exceeded expectations!",
-                "Fast shipping, great product!",
-            ]),
-            price=f"${random.randint(9, 99)}.{random.randint(0, 99):02d}",
-        )
+        if background:
+            if account_id in state.active_post_tasks:
+                raise HTTPException(status_code=409, detail="Post already in progress for this account")
+            session_id = f"post_{account_id}_{int(time.time())}"
+            state.event_bus.create_session(session_id)
+            state.active_post_tasks[account_id] = session_id
+            asyncio.create_task(_run_post_upload(state, account_id, body, session_id))
+            return {
+                "success": True,
+                "message": f"Post started for account {account_id}",
+                "session_id": session_id,
+                "ws_url": f"/api/ws/{session_id}",
+            }
 
-        if not post_dir:
-            raise HTTPException(status_code=500, detail="Content generation failed")
-
-        # Upload
-        result = await state.post_engine.upload_slideshow(
-            account_id=account_id,
-            images_dir=post_dir,
-            caption="Check this out! 🔥",
-            hashtags="fyp foryou viral",
-            username=account.username,
-        )
-
-        return {"success": result.get("success", False), "result": result}
+        session_id = f"post_{account_id}_{int(time.time())}"
+        state.event_bus.create_session(session_id)
+        await _run_post_upload(state, account_id, body, session_id)
+        return {"success": True, "message": "Post completed", "session_id": session_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -819,42 +1231,79 @@ async def trigger_post(request: Request, account_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/profile/status")
-async def profile_service_status(request: Request):
-    """Check if TikTok profile sync is ready."""
-    state = get_state(request)
-    return {"success": True, "status": state.tiktok_profile.status()}
-
-
-@router.post("/actions/sync-profile/{account_id}")
-async def sync_profile(request: Request, account_id: int):
-    """Manually trigger TikTok profile sync for an account."""
+@router.post("/actions/upload/video/{account_id}")
+async def upload_video_post(
+    request: Request,
+    account_id: int,
+    body: VideoUploadBody = Body(...),
+):
+    """Upload an mp4 video file to TikTok."""
     state = get_state(request)
     try:
         account = state.account_manager.get_account(account_id)
         if not account:
             raise HTTPException(status_code=404, detail="Account not found")
 
-        svc = state.tiktok_profile
-        status = svc.status()
-        if not status["ready"]:
-            issues = []
-            if not status["installed"]:
-                issues.append("TikTokApi not installed")
-            if not status["configured"]:
-                issues.append("TIKTOK_MS_TOKEN not set")
-            msg = "Profile sync not ready: " + "; ".join(issues)
-            raise HTTPException(status_code=400, detail=msg)
+        proxy = _account_proxy_url(state, account)
+        post_id = state.account_manager.add_post(
+            account_id,
+            body.video_path,
+            body.caption,
+            body.hashtags,
+            body.affiliate_link,
+        )
+        result = await state.post_engine.upload_video(
+            account_id=account_id,
+            video_path=body.video_path,
+            caption=body.caption or "",
+            hashtags=body.hashtags or "fyp foryou viral",
+            affiliate_link=body.affiliate_link,
+            username=account.username,
+            password=account.password or "",
+            cookie_data=account.cookie_data,
+            proxy_url=proxy,
+        )
+        if post_id and result.get("success"):
+            state.account_manager.mark_post_posted(
+                post_id, tiktok_post_id=result.get("post_id"), views=0
+            )
+        return {"success": result.get("success", False), "result": result, "post_id": post_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading video for {account_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-        profile = await svc.fetch_profile(account.username)
-        updates = {
-            "followers": profile.get("followers", 0),
-            "following": profile.get("following", 0),
-            "total_posts": profile.get("video_count", 0),
-            "status": "active",
-        }
-        state.account_manager.update_account(account_id, **updates)
-        return {"success": True, "profile": profile, "updates": updates}
+
+@router.post("/actions/sync-profile/{account_id}")
+async def sync_profile(request: Request, account_id: int):
+    """Manually trigger browser profile sync for an account."""
+    state = get_state(request)
+    try:
+        account = state.account_manager.get_account(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+
+        scanner_status = state.profile_scanner.status()
+        if not scanner_status.get("ready"):
+            raise HTTPException(status_code=503, detail="Profile scanner not ready (install Playwright)")
+
+        proxy_url = _profile_proxy_url(state, account.proxy_id)
+        result = await state.profile_scanner.fetch_profile(account.username, proxy_url=proxy_url)
+        if not result.get("success"):
+            _profile_scan_http_error(result)
+
+        updated = _apply_profile_scan_to_account(state, account_id, result)
+        updates = {}
+        if updated:
+            updates = {
+                "followers": result.get("followers", 0),
+                "following": result.get("following", 0),
+                "total_posts": result.get("total_posts", 0),
+                "total_views": result.get("likes", 0),
+                "status": "active",
+            }
+        return {"success": True, "profile": result, "updates": updates}
     except HTTPException:
         raise
     except Exception as e:
@@ -970,88 +1419,6 @@ async def affiliate_run_account(request: Request, account_id: int):
         logger.error(f"Affiliate run failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ---- TikTok API Settings ----
-
-SETTINGS_FILE = Path(__file__).parent.parent / "config" / "settings.yaml"
-
-@router.get("/settings/tiktok-api")
-async def get_tiktok_api_settings(request: Request):
-    """Get current TikTok API configuration."""
-    state = get_state(request)
-    svc_status = state.tiktok_profile.status()
-    return {
-        "success": True,
-        "settings": {
-            "ms_token": bool(os.environ.get("TIKTOK_MS_TOKEN", "")),
-            "browser": os.environ.get("TIKTOK_BROWSER", "chromium"),
-            "installed": svc_status.get("installed", False),
-            "ready": svc_status.get("ready", False),
-        }
-    }
-
-@router.post("/settings/tiktok-api/token")
-async def set_tiktok_ms_token(request: Request, data: dict = Body(...)):
-    """Save TIKTOK_MS_TOKEN to environment and settings file."""
-    ms_token = data.get("ms_token", "").strip()
-    if not ms_token:
-        raise HTTPException(status_code=400, detail="ms_token is required")
-    if len(ms_token) < 20:
-        raise HTTPException(status_code=400, detail="ms_token looks invalid (too short)")
-
-    try:
-        # Write to .env file in config dir
-        env_path = Path(__file__).parent.parent / "config" / ".env"
-        env_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(env_path, "w") as f:
-            f.write(f"TIKTOK_MS_TOKEN={ms_token}\n")
-            f.write(f"TIKTOK_BROWSER={data.get('browser', 'chromium')}\n")
-
-        # Also set in running process
-        os.environ["TIKTOK_MS_TOKEN"] = ms_token
-
-        # Reinitialize the profile service
-        state = get_state(request)
-        state.tiktok_profile.ms_token = ms_token
-
-        return {"success": True, "message": "ms_token saved successfully. Restart container for full effect."}
-    except Exception as e:
-        logger.error(f"Failed to save ms_token: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/settings/tiktok-api/test")
-async def test_tiktok_api_connection(request: Request):
-    """Test TikTok API connection by creating a session."""
-    state = get_state(request)
-    svc = state.tiktok_profile
-    status = svc.status()
-
-    if not status["installed"]:
-        return {"success": False, "message": "TikTokApi is not installed"}
-    if not status["configured"]:
-        return {"success": False, "message": "TIKTOK_MS_TOKEN is not set"}
-
-    try:
-        # Try to create session and fetch a known profile
-        profile = await svc.fetch_profile("tiktok")
-        if profile and profile.get("username"):
-            return {
-                "success": True,
-                "message": f"Connected! @{profile['username']} - {profile.get('followers', 0)} followers",
-                "profile": profile,
-            }
-        return {"success": False, "message": "Could not verify connection"}
-    except Exception as e:
-        error_msg = str(e)
-        if "timeout" in error_msg.lower():
-            return {"success": False, "message": "Connection timeout - server IP may be blocked by TikTok"}
-        return {"success": False, "message": f"Connection failed: {error_msg[:200]}"}
-
-@router.get("/settings/tiktok-api/status")
-async def get_tiktok_api_status(request: Request):
-    """Get detailed TikTok API status."""
-    state = get_state(request)
-    return {"success": True, "status": state.tiktok_profile.status()}
 
 # ---- Dashboard HTML ----
 

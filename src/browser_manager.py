@@ -25,6 +25,13 @@ try:
 except ImportError:
     AsyncCamoufox = None  # type: ignore
 
+STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+window.chrome = { runtime: {} };
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+"""
+
 
 class BrowserManager:
     """Singleton factory managing browser instances per account (Camoufox or Chromium).
@@ -105,6 +112,7 @@ class BrowserManager:
                 "--disable-web-security",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--disable-blink-features=AutomationControlled",
+                "--lang=en-US",
             ],
         }
         self._browser = await self._playwright.chromium.launch(**launch_options)
@@ -181,14 +189,15 @@ class BrowserManager:
         if not cookies:
             return False
         try:
+            from src.cookie_manager import CookieManager
+
             path = self._storage_state_path(account_id)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            state = {"cookies": cookies, "origins": []}
-            path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-            logger.info(
-                f"Created storage_state for account {account_id} ({len(cookies)} cookies)"
-            )
-            return True
+            ok = CookieManager.save_to_storage_state(cookies, str(path))
+            if ok:
+                logger.info(
+                    f"Created storage_state for account {account_id} ({len(cookies)} cookies)"
+                )
+            return ok
         except Exception as e:
             logger.warning(f"Failed to write storage_state for {account_id}: {e}")
             return False
@@ -210,6 +219,7 @@ class BrowserManager:
         proxy_url: Optional[str] = None,
         user_agent: Optional[str] = None,
         viewport: Optional[Dict] = None,
+        extra_http_headers: Optional[Dict[str, str]] = None,
     ) -> BrowserContext:
         async with self._lock:
             if account_id in self._contexts:
@@ -230,11 +240,17 @@ class BrowserManager:
             }
             if user_agent:
                 context_options["user_agent"] = user_agent
+            if extra_http_headers:
+                context_options["extra_http_headers"] = extra_http_headers
 
             storage_path = self._storage_state_path(account_id)
-            storage_path.parent.mkdir(parents=True, exist_ok=True)
-            if storage_path.exists():
-                context_options["storage_state"] = str(storage_path)
+            # Ephemeral scan contexts (high account_id) skip persisted cookies
+            if account_id >= 900_000_000:
+                storage_path = None
+            if storage_path:
+                storage_path.parent.mkdir(parents=True, exist_ok=True)
+                if storage_path.exists():
+                    context_options["storage_state"] = str(storage_path)
 
             if proxy_url:
                 try:
@@ -251,9 +267,17 @@ class BrowserManager:
                 context = await self._browser.new_context(**context_options)
 
             context.set_default_timeout(self.navigation_timeout)
+            self.apply_stealth(context)
             self._contexts[account_id] = context
             logger.info(f"Browser context created for account {account_id}")
             return context
+
+    def apply_stealth(self, context: "BrowserContext") -> None:
+        """Anti-detection init scripts (tiktok-uploader browsers.py pattern)."""
+        try:
+            context.add_init_script(STEALTH_INIT_SCRIPT)
+        except Exception as e:
+            logger.debug(f"apply_stealth failed: {e}")
 
     async def save_storage_state(self, account_id: int):
         """Persist cookies/local storage to profile dir."""
@@ -282,7 +306,8 @@ class BrowserManager:
 
     async def close_context(self, account_id: int):
         async with self._lock:
-            await self.save_storage_state(account_id)
+            if account_id < 900_000_000:
+                await self.save_storage_state(account_id)
             if account_id in self._pages:
                 try:
                     await self._pages[account_id].close()

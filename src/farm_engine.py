@@ -4,8 +4,11 @@
 import asyncio
 import logging
 import random
+import time
 from typing import List, Optional
 from datetime import datetime
+
+from src.event_bus import FarmEventBus
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +38,23 @@ class FarmEngine:
     Each session mimics real user behavior with random timing and actions.
     """
 
-    def __init__(self, browser_manager, account_manager=None):
+    def __init__(self, browser_manager, account_manager=None, event_bus=None):
         self.browser = browser_manager
         self.account_mgr = account_manager
+        self.event_bus = event_bus or FarmEventBus.get_instance()
         self._running = False
+        self._session_id: Optional[str] = None
+        self._current_account_id: Optional[int] = None
+        self._session_start_ts: float = 0
+
+    def _emit(self, event_type: str, data: Optional[dict] = None):
+        if self.event_bus and self._session_id:
+            self.event_bus.emit(
+                self._session_id,
+                event_type,
+                account_id=self._current_account_id,
+                data=data or {},
+            )
 
     async def _random_delay(self, min_s: float = 0.5, max_s: float = 3.0):
         """Sleep for a random duration to simulate human behavior."""
@@ -64,6 +80,7 @@ class FarmEngine:
         Mimics real behavior: scroll, pause, watch short clips, scroll again.
         """
         logger.info(f"[Account {account_id}] Starting scroll feed for {duration_minutes} min")
+        self._emit("farm:log", {"level": "INFO", "message": f"Scrolling feed ({duration_minutes} min)..."})
 
         stats = {
             "videos_viewed": 0,
@@ -467,12 +484,25 @@ class FarmEngine:
 
         return stats
 
+    def _aggregate_stats(self, session_stats: dict) -> dict:
+        out = {"scrolls": 0, "likes": 0, "comments": 0, "follows": 0, "videos_seen": 0}
+        for val in (session_stats.get("actions") or {}).values():
+            if not isinstance(val, dict):
+                continue
+            out["scrolls"] += val.get("scrolls", 0)
+            out["likes"] += val.get("liked", 0)
+            out["comments"] += val.get("commented", 0)
+            out["follows"] += val.get("followed", 0)
+            out["videos_seen"] += val.get("videos_viewed", val.get("watched", 0))
+        return out
+
     async def run_farm_session(
         self,
         account_id: int,
         proxy_url: Optional[str] = None,
         duration_minutes: int = 15,
         actions: Optional[dict] = None,
+        session_id: Optional[str] = None,
     ) -> dict:
         """Run a complete farm session combining multiple behaviors.
 
@@ -495,11 +525,23 @@ class FarmEngine:
                 "watch": 3,
             }
 
+        self._session_id = session_id or f"farm_{account_id}_{int(time.time())}"
+        self._current_account_id = account_id
+        self._session_start_ts = time.time()
+        if not self.event_bus.has_session(self._session_id):
+            self.event_bus.create_session(self._session_id)
+        self._emit(
+            "farm:start",
+            {"duration": duration_minutes, "actions": actions, "session_id": self._session_id},
+        )
+
         logger.info(f"[Account {account_id}] Starting farm session ({duration_minutes} min, actions: {actions})")
         self._running = True
+        scroll_duration = max(3, duration_minutes // 3)
 
         session_stats = {
             "account_id": account_id,
+            "session_id": self._session_id,
             "started_at": datetime.now().isoformat(),
             "duration_minutes": duration_minutes,
             "actions": {},
@@ -508,7 +550,6 @@ class FarmEngine:
         try:
             # Phase 1: Scroll feed (always)
             if actions.get("scroll", True):
-                scroll_duration = max(3, duration_minutes // 3)
                 scroll_stats = await self.scroll_feed(
                     account_id, proxy_url, duration_minutes=scroll_duration
                 )
@@ -556,14 +597,26 @@ class FarmEngine:
             session_stats["actions"]["final_scroll"] = final_scroll
 
             session_stats["completed"] = True
+            self._emit("farm:log", {"level": "INFO", "message": "Farm session completed successfully"})
             logger.info(f"[Account {account_id}] Farm session completed successfully")
 
         except Exception as e:
             logger.error(f"[Account {account_id}] Farm session error: {e}", exc_info=True)
             session_stats["completed"] = False
             session_stats["error"] = str(e)
+            self._emit("farm:error", {"message": str(e), "recoverable": False})
         finally:
             self._running = False
+            self._emit(
+                "farm:complete",
+                {
+                    "stats": self._aggregate_stats(session_stats),
+                    "duration": int(time.time() - self._session_start_ts),
+                    "success": session_stats.get("completed", False),
+                },
+            )
+            self._session_id = None
+            self._current_account_id = None
             # Save cookies to DB before cleanup
             try:
                 if self.account_mgr and account_id in self.browser._pages:

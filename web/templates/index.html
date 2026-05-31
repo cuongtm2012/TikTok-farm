@@ -79,6 +79,13 @@
                 <span class="nav-badge" id="navBadgeAffiliate">0</span>
               </a>
             </li>
+            <li>
+              <a href="#posts" class="nav-link" data-section="posts" data-title="Posts" data-subtitle="Slideshow &amp; video upload history">
+                <i data-lucide="image"></i>
+                <span class="nav-link-text">Posts</span>
+                <span class="nav-badge" id="navBadgePosts">0</span>
+              </a>
+            </li>
           </ul>
         </div>
 
@@ -308,6 +315,28 @@
       </section>
       </section>
 
+      <section class="page-section" id="posts">
+      <section class="section">
+        <div class="section-head">
+          <h2 class="section-title">
+            <i data-lucide="image" style="width:20px;height:20px"></i>
+            Post history
+          </h2>
+          <div class="section-actions">
+            <select id="postsFilterAccount" class="search-input" style="width:auto;min-width:10rem" aria-label="Filter by account">
+              <option value="">All accounts</option>
+            </select>
+            <button class="btn btn-sm" type="button" id="btnRefreshPosts">
+              <i data-lucide="refresh-cw"></i> Refresh
+            </button>
+          </div>
+        </div>
+        <div class="table-wrap" id="postsTable">
+          <div class="empty-state">Loading posts…</div>
+        </div>
+      </section>
+      </section>
+
       <!-- Settings section -->
       <section class="page-section" id="settings">
       <section class="section">
@@ -323,6 +352,24 @@
       </section>
       </section>
       </main>
+
+      <!-- Live farm / post monitor -->
+      <aside class="live-log-panel" id="liveLogPanel" hidden>
+        <div class="live-log-head">
+          <div>
+            <strong id="liveLogTitle">Live session</strong>
+            <span class="live-log-account" id="liveLogAccount"></span>
+          </div>
+          <button type="button" class="btn btn-icon" id="liveLogClose" aria-label="Close log panel">
+            <i data-lucide="x"></i>
+          </button>
+        </div>
+        <div class="live-progress-wrap">
+          <div class="live-progress-bar" id="liveProgressBar" style="width:0%"></div>
+        </div>
+        <div class="live-log-body" id="liveLogBody"></div>
+        <div class="live-log-foot" id="liveLogFoot"></div>
+      </aside>
     </div>
   </div>
 
@@ -506,6 +553,63 @@
       <div class="modal-footer">
         <button type="button" class="btn" data-close="modalProxy">Cancel</button>
         <button type="button" class="btn btn-primary" id="btnSubmitProxy">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Post composer modal -->
+  <div class="modal-backdrop" id="modalPostComposer" role="dialog" aria-modal="true">
+    <div class="modal modal-lg">
+      <div class="modal-header">
+        <h3 id="postComposerTitle">Compose post</h3>
+        <button type="button" class="modal-close" data-close="modalPostComposer" aria-label="Close">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="postComposerAccountId" value="">
+        <div class="form-grid">
+          <div class="form-row">
+            <label>Post type</label>
+            <div class="post-type-toggle">
+              <label><input type="radio" name="postType" value="slideshow" checked> Slideshow (auto)</label>
+              <label><input type="radio" name="postType" value="video"> Video (file path)</label>
+            </div>
+          </div>
+          <div class="form-row" id="postVideoPathRow" hidden>
+            <label for="postVideoPath">Video path</label>
+            <input id="postVideoPath" type="text" placeholder="/path/to/video.mp4">
+          </div>
+          <div class="form-row">
+            <label for="postCaption">Caption</label>
+            <textarea id="postCaption" rows="2" placeholder="Check this out! 🔥"></textarea>
+          </div>
+          <div class="form-row">
+            <label for="postHashtags">Hashtags</label>
+            <input id="postHashtags" type="text" value="fyp foryou viral" placeholder="fyp foryou viral">
+          </div>
+          <div class="form-row">
+            <label for="postAffiliateLink">Affiliate link (optional)</label>
+            <input id="postAffiliateLink" type="url" placeholder="https://...">
+          </div>
+          <div class="form-row form-row-inline">
+            <label for="postTemplate">Template</label>
+            <select id="postTemplate"><option value="default">default</option></select>
+          </div>
+        </div>
+        <div class="preview-strip" id="postPreviewStrip">
+          <p class="form-hint">Click Generate to preview slideshow slides</p>
+        </div>
+        <input type="hidden" id="postImagesDir" value="">
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" data-close="modalPostComposer">Cancel</button>
+        <button type="button" class="btn" id="btnPostGenerate">
+          <i data-lucide="refresh-cw"></i> Generate
+        </button>
+        <button type="button" class="btn btn-primary" id="btnPostSubmit">
+          <i data-lucide="upload"></i> Post
+        </button>
       </div>
     </div>
   </div>

@@ -1,35 +1,147 @@
-# TikTok Farm - Post Engine Module
-# Uploads slideshow posts to TikTok via Camoufox/Playwright
+# TikTok Farm — Post Engine v4 (tiktok-uploader selectors + flow, async Playwright)
 
 import asyncio
 import json
 import logging
 import random
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, List, Dict
-from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
+
+import yaml
+
+from src.cookie_manager import CookieManager
 
 logger = logging.getLogger(__name__)
 
+UPLOAD_TIMEOUT_DEFAULT_MS = 200_000
+
+
+# ---- Exceptions ----
+
+
+class PostError(Exception):
+    """Base post engine error."""
+
+
+class CookieExpiredError(PostError):
+    """Cookies expired — need fresh session."""
+
+
+class UploadTimeoutError(PostError):
+    """Media upload timed out."""
+
+
+class PostRejectedError(PostError):
+    """TikTok rejected the post."""
+
+
+class ScheduleInvalidError(PostError):
+    """Schedule time invalid."""
+
+
+# ---- Schedule validation (tiktok-uploader) ----
+
+
+def validate_schedule(dt: datetime) -> tuple:
+    """Returns (is_valid, error_message). Uses UTC for comparison."""
+    if dt.tzinfo is None:
+        now = datetime.utcnow()
+        dt_cmp = dt
+    else:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        dt_cmp = dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    if dt_cmp < now + timedelta(minutes=20):
+        return False, "Schedule must be at least 20 minutes in the future"
+    if dt_cmp > now + timedelta(days=10):
+        return False, "Schedule cannot be more than 10 days in advance"
+    if dt_cmp.minute % 5 != 0:
+        return False, "Schedule minute must be a multiple of 5"
+    return True, ""
+
+
+def parse_schedule_at(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00").replace(" ", "T")[:19])
+    except ValueError:
+        return None
+
+
+def sanitize_caption(text: str) -> str:
+    """Remove BMP-out-of-range chars (problematic emojis for TikTok editor)."""
+    if not text:
+        return ""
+    return "".join(c for c in text if ord(c) <= 0xFFFF)
+
+
+def load_selectors(config_path: str = "config/selectors.yaml") -> Dict[str, Any]:
+    path = Path(config_path)
+    if not path.is_file():
+        path = Path(__file__).resolve().parent.parent / "config" / "selectors.yaml"
+    if path.is_file():
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def _format_caption(caption: str, hashtags: str) -> str:
+    caption = sanitize_caption(caption or "")
+    if hashtags:
+        tags = " ".join(f"#{t.strip().lstrip('#')}" for t in hashtags.split() if t.strip())
+        caption = f"{caption}\n\n{tags}".strip() if caption else tags
+    return caption
+
+
+# ---- Post engine ----
+
 
 class PostEngine:
-    """Handles TikTok post upload via Playwright automation.
+    """Upload TikTok video/slideshow via Creator Center (Playwright)."""
 
-    Handles login session management, slideshow upload, caption/hashtag entry,
-    and affiliate link tagging.
-    """
-
-    # TikTok upload URL
-    UPLOAD_URL = "https://www.tiktok.com/upload"
-    LOGIN_URL = "https://www.tiktok.com/login"
-
-    def __init__(self, browser_manager, account_manager=None):
+    def __init__(self, browser_manager, account_manager=None, cookie_manager=None):
         self.browser = browser_manager
         self.account_mgr = account_manager
-        self._login_cache: Dict[int, bool] = {}  # account_id -> logged_in
+        self.cookie_mgr = cookie_manager or CookieManager()
+        self._login_cache: Dict[int, bool] = {}
+        self.selectors = load_selectors()
+        self.upload_sel = self.selectors.get("upload", {})
+        self.cover_sel = self.selectors.get("cover", {})
+        self.schedule_sel = self.selectors.get("schedule", {})
+        self.login_sel = self.selectors.get("login_indicators", {})
+
+    def _upload_url(self) -> str:
+        return self.upload_sel.get("upload_page") or "https://www.tiktok.com/creator-center/upload?lang=en"
+
+    def _upload_timeout(self) -> int:
+        return int(self.upload_sel.get("upload_timeout_ms") or UPLOAD_TIMEOUT_DEFAULT_MS)
+
+    async def _locator(self, page, xpath: str):
+        if not xpath:
+            return None
+        return page.locator(f"xpath={xpath}").first
+
+    async def _click_xpath(self, page, xpath: str, timeout: int = 5000) -> bool:
+        try:
+            loc = await self._locator(page, xpath)
+            if loc and await loc.count():
+                await loc.click(timeout=timeout)
+                return True
+        except Exception as e:
+            logger.debug(f"Click xpath failed ({xpath[:40]}...): {e}")
+        return False
+
+    async def _wait_xpath(self, page, xpath: str, timeout: int = 30000) -> bool:
+        try:
+            await page.wait_for_selector(f"xpath={xpath}", timeout=timeout)
+            return True
+        except Exception:
+            return False
 
     async def _persist_session(self, account_id: int, page) -> None:
-        """Save cookies to DB and browser storage_state file."""
         try:
             cookies = await page.context.cookies()
             if self.account_mgr and cookies:
@@ -37,6 +149,27 @@ class PostEngine:
             await self.browser.save_storage_state(account_id)
         except Exception as e:
             logger.warning(f"[Account {account_id}] Session persist failed: {e}")
+
+    async def _inject_cookies(self, account_id: int, cookie_data: Optional[str]) -> None:
+        cookies = self.cookie_mgr.cookies_from_account_data(cookie_data)
+        if not cookies:
+            return
+        if not self.cookie_mgr.validate_session(cookies):
+            logger.warning(f"[Account {account_id}] No sessionid in cookies")
+        path = self.browser._storage_state_path(account_id)
+        self.cookie_mgr.save_to_storage_state(cookies, str(path))
+
+    async def _check_cookie_expired(self, page) -> bool:
+        url = page.url.lower()
+        if self.login_sel.get("login_url_fragment", "/login") in url:
+            return True
+        try:
+            body = (await page.inner_text("body")).lower()
+            if self.login_sel.get("cookie_expired_text", "").lower() in body:
+                return True
+        except Exception:
+            pass
+        return False
 
     async def _ensure_login(
         self,
@@ -46,307 +179,269 @@ class PostEngine:
         password: str = "",
         cookie_data: Optional[str] = None,
     ) -> bool:
-        """Ensure the account is logged in. Uses cookies if available, otherwise tries credentials."""
-        # Check if we already logged in this session
-        if account_id in self._login_cache and self._login_cache[account_id]:
+        if self._login_cache.get(account_id):
             return True
 
+        await self._inject_cookies(account_id, cookie_data)
+
         try:
-            # First try: navigate and see if already logged in
             await self.browser.navigate_safe(page, "https://www.tiktok.com/")
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
-            # Check if we're logged in by looking for user avatar or profile element
+            if await self._check_cookie_expired(page):
+                if cookie_data:
+                    cookies = self.cookie_mgr.cookies_from_account_data(cookie_data)
+                    if cookies:
+                        await page.context.add_cookies(self.cookie_mgr.to_playwright_format(cookies))
+                        await page.reload()
+                        await asyncio.sleep(2)
+
+            if await self._check_cookie_expired(page):
+                raise CookieExpiredError("Session expired — update cookies for this account")
+
             logged_in = await page.query_selector(
-                'a[href*="/@"][class*="avatar"], '
-                'a[href*="/@"] img[alt], '
-                '[data-e2e="user-avatar"], [data-e2e="profile-icon"], '
-                '[class*="avatar"]'
+                '[data-e2e="user-avatar"], a[href*="/@"] img, [class*="avatar"]'
             )
-
             if logged_in:
-                logger.info(f"[Account {account_id}] Already logged in")
                 self._login_cache[account_id] = True
                 await self._persist_session(account_id, page)
                 return True
 
-            # Second try: use cookies if available
             if cookie_data:
-                try:
-                    cookies = json.loads(cookie_data)
-                    if isinstance(cookies, list):
-                        await page.context.add_cookies(cookies)
-                        await page.reload()
-                        await asyncio.sleep(3)
+                cookies = self.cookie_mgr.cookies_from_account_data(cookie_data)
+                if cookies:
+                    await page.context.add_cookies(self.cookie_mgr.to_playwright_format(cookies))
+                    await page.reload()
+                    await asyncio.sleep(3)
+                    if not await self._check_cookie_expired(page):
+                        self._login_cache[account_id] = True
+                        await self._persist_session(account_id, page)
+                        return True
 
-                        logged_in = await page.query_selector(
-                            '[data-e2e="user-avatar"], [class*="avatar"]'
-                        )
-                        if logged_in:
-                            logger.info(f"[Account {account_id}] Logged in via cookies")
-                            self._login_cache[account_id] = True
-                            await self._persist_session(account_id, page)
-                            return True
-                except Exception as e:
-                    logger.warning(f"[Account {account_id}] Cookie login failed: {e}")
-
-            # Third try: manual login (requires credentials)
-            if username and password:
-                logger.info(f"[Account {account_id}] Attempting login with credentials")
-                await self.browser.navigate_safe(page, self.LOGIN_URL)
-                await asyncio.sleep(3)
-
-                # Click "Use phone / email / username" option
-                use_username_btn = await page.query_selector(
-                    'div:has-text("Use phone / email / username"), '
-                    'a:has-text("Log in with"), [data-e2e="login-with-username"]'
-                )
-                if use_username_btn:
-                    await use_username_btn.click()
-                    await asyncio.sleep(2)
-
-                # Fill in username
-                username_input = await page.query_selector(
-                    'input[name="username"], input[placeholder*="username"], '
-                    'input[placeholder*="Username"], input[autocomplete="username"]'
-                )
-                if username_input:
-                    await username_input.fill(username)
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
-
-                # Fill in password
-                password_input = await page.query_selector(
-                    'input[type="password"], input[name="password"]'
-                )
-                if password_input:
-                    await password_input.fill(password)
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
-
-                # Click login button
-                login_btn = await page.query_selector(
-                    'button:has-text("Log in"), button:has-text("Login"), '
-                    '[type="submit"]'
-                )
-                if login_btn:
-                    await login_btn.click()
-                    await asyncio.sleep(5)
-
-                # Check if login succeeded
-                logged_in = await page.query_selector(
-                    '[data-e2e="user-avatar"], [class*="avatar"]'
-                )
-                if logged_in:
-                    logger.info(f"[Account {account_id}] Login successful")
-                    self._login_cache[account_id] = True
-                    await self._persist_session(account_id, page)
-                    return True
-                else:
-                    logger.warning(f"[Account {account_id}] Login failed - check credentials")
-                    return False
-
-            logger.warning(f"[Account {account_id}] No login method available")
-            return False
-
+            raise CookieExpiredError("Not logged in — provide valid session cookies")
+        except CookieExpiredError:
+            raise
         except Exception as e:
-            logger.error(f"[Account {account_id}] Login error: {e}", exc_info=True)
+            logger.error(f"[Account {account_id}] Login check error: {e}")
             return False
 
-    async def upload_slideshow(
+    async def _dismiss_split_window(self, page) -> None:
+        xpath = self.upload_sel.get("split_window")
+        if xpath:
+            await self._click_xpath(page, xpath, timeout=3000)
+            await asyncio.sleep(0.5)
+
+    async def _set_caption(self, page, text: str) -> None:
+        xpath = self.upload_sel.get("description")
+        if xpath:
+            loc = await self._locator(page, xpath)
+            if loc and await loc.count():
+                await loc.click()
+                await loc.fill(text)
+                return
+        fallback = await page.query_selector(
+            '[data-e2e="caption-input"], div[contenteditable="true"], textarea'
+        )
+        if fallback:
+            await fallback.click()
+            try:
+                await fallback.fill(text)
+            except Exception:
+                await fallback.type(text, delay=15)
+
+    async def _set_interactivity(self, page) -> None:
+        for key in ("comment_toggle", "stitch_toggle", "duet_toggle"):
+            xpath = self.upload_sel.get(key)
+            if not xpath:
+                continue
+            try:
+                loc = await self._locator(page, xpath)
+                if loc and await loc.count():
+                    checked = await loc.is_checked()
+                    if not checked:
+                        await loc.check()
+            except Exception:
+                pass
+
+    async def _set_cover(self, page, cover_path: str) -> None:
+        if not cover_path or not Path(cover_path).is_file():
+            return
+        if not await self._click_xpath(page, self.cover_sel.get("edit_cover_button", ""), 8000):
+            return
+        await asyncio.sleep(1)
+        await self._click_xpath(page, self.cover_sel.get("upload_cover_tab", ""), 5000)
+        await asyncio.sleep(0.5)
+        inp_xpath = self.cover_sel.get("upload_cover_input")
+        if inp_xpath:
+            loc = await self._locator(page, inp_xpath)
+            if loc:
+                await loc.set_input_files(cover_path)
+                await asyncio.sleep(2)
+        await self._click_xpath(page, self.cover_sel.get("confirm_cover", ""), 8000)
+        await asyncio.sleep(1)
+
+    async def _set_schedule(self, page, schedule_dt: datetime) -> None:
+        ok, msg = validate_schedule(schedule_dt)
+        if not ok:
+            raise ScheduleInvalidError(msg)
+
+        sw = self.schedule_sel.get("switch")
+        if not sw:
+            logger.warning("Schedule switch selector missing — skipping schedule UI")
+            return
+
+        if not await self._click_xpath(page, sw, 5000):
+            logger.warning("Slideshow may not support schedule — continuing without schedule")
+            return
+
+        await asyncio.sleep(1)
+        await self._click_xpath(page, self.schedule_sel.get("date_picker", ""), 5000)
+        await asyncio.sleep(0.5)
+
+        target_day = schedule_dt.day
+        days_xpath = self.schedule_sel.get("calendar_valid_days")
+        if days_xpath:
+            locators = page.locator(f"xpath={days_xpath}")
+            count = await locators.count()
+            for i in range(count):
+                el = locators.nth(i)
+                txt = (await el.inner_text()).strip()
+                if txt.isdigit() and int(txt) == target_day:
+                    await el.click()
+                    break
+
+        await self._click_xpath(page, self.schedule_sel.get("time_picker", ""), 5000)
+        hour = schedule_dt.hour % 12 or 12
+        minute = (schedule_dt.minute // 5) * 5
+        hour_xpath = self.schedule_sel.get("timepicker_hours")
+        min_xpath = self.schedule_sel.get("timepicker_minutes")
+        if hour_xpath:
+            loc = page.locator(f"xpath={hour_xpath}")
+            if await loc.count():
+                await loc.first.click()
+        if min_xpath:
+            loc = page.locator(f"xpath={min_xpath}")
+            if await loc.count():
+                await loc.first.click()
+        logger.info(f"Schedule set ~{hour}:{minute:02d} (UI may need manual verify)")
+
+    async def _upload_media(self, page, file_paths: List[str]) -> None:
+        if not file_paths:
+            raise PostRejectedError("No media files to upload")
+
+        xpath = self.upload_sel.get("file_input")
+        timeout = self._upload_timeout()
+        uploaded = False
+
+        if xpath:
+            loc = await self._locator(page, xpath)
+            if loc and await loc.count():
+                await loc.set_input_files(file_paths if len(file_paths) > 1 else file_paths[0])
+                uploaded = True
+
+        if not uploaded:
+            inp = await page.query_selector('input[type="file"]')
+            if inp:
+                await inp.set_input_files(file_paths if len(file_paths) > 1 else file_paths[0])
+                uploaded = True
+
+        if not uploaded:
+            raise PostRejectedError("Could not find file upload input")
+
+        finished = self.upload_sel.get("upload_finished")
+        if finished:
+            if not await self._wait_xpath(page, finished, timeout=timeout):
+                raise UploadTimeoutError("Media upload processing timed out")
+        else:
+            await asyncio.sleep(min(30, timeout // 1000))
+
+    async def _click_post(self, page) -> bool:
+        xpath = self.upload_sel.get("post_button")
+        if xpath and await self._click_xpath(page, xpath, 10000):
+            return True
+        for sel in (
+            'button:has-text("Post")',
+            '[data-e2e="post_video_button"]',
+            '[data-e2e="post-button"]',
+        ):
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click()
+                return True
+        return False
+
+    async def _wait_post_confirmation(self, page, timeout: int = 60000) -> bool:
+        xpath = self.upload_sel.get("post_confirmation")
+        if xpath:
+            return await self._wait_xpath(page, xpath, timeout=timeout)
+        await asyncio.sleep(10)
+        return True
+
+    async def _do_upload(
         self,
         account_id: int,
-        images_dir: str,
+        file_paths: List[str],
         caption: str = "",
         hashtags: str = "",
-        affiliate_link: str = "",
+        schedule_dt: Optional[datetime] = None,
+        cover_path: Optional[str] = None,
         username: str = "",
         password: str = "",
         cookie_data: Optional[str] = None,
         proxy_url: Optional[str] = None,
-    ) -> Dict:
-        """Upload a slideshow post to TikTok.
-
-        Args:
-            account_id: Account ID
-            images_dir: Directory containing slide images (from content pipeline)
-            caption: Post caption text
-            hashtags: Space-separated hashtags (without #)
-            affiliate_link: TikTok Shop affiliate link
-            username: Account username (for login)
-            password: Account password (for login)
-            cookie_data: JSON cookie data (optional)
-            proxy_url: Proxy URL
-
-        Returns:
-            Dict with post results
-        """
-        logger.info(f"[Account {account_id}] Starting slideshow upload from {images_dir}")
-
+    ) -> Dict[str, Any]:
         result = {
             "success": False,
             "post_id": None,
+            "post_url": None,
+            "tiktok_post_id": None,
             "error": None,
             "posted_at": None,
         }
 
-        try:
-            page = await self.browser.get_page(account_id, proxy_url)
+        page = await self.browser.get_page(account_id, proxy_url)
+        self.browser.apply_stealth(page.context)
 
-            # Ensure login
-            logged_in = await self._ensure_login(page, account_id, username, password, cookie_data)
-            if not logged_in:
-                result["error"] = "Login failed"
-                logger.error(f"[Account {account_id}] Cannot upload: {result['error']}")
-                return result
+        await self._ensure_login(page, account_id, username, password, cookie_data)
 
-            # Navigate to upload page
-            await self.browser.navigate_safe(page, self.UPLOAD_URL)
-            await asyncio.sleep(5)
+        upload_url = self._upload_url()
+        if not await self.browser.navigate_safe(page, upload_url, timeout=60000):
+            raise UploadTimeoutError("Failed to load TikTok upload page")
 
-            # Check if upload page loaded
-            upload_ready = await page.query_selector(
-                '[data-e2e="upload-button"], [class*="upload"], input[type="file"]'
-            )
-            if not upload_ready:
-                logger.warning(f"[Account {account_id}] Upload page may not have loaded fully")
-                await asyncio.sleep(3)
+        await asyncio.sleep(3)
+        if await self._check_cookie_expired(page):
+            raise CookieExpiredError("Redirected to login on upload page")
 
-            # Click "Select files" or upload button
-            # TikTok's upload uses a hidden file input
-            file_input = await page.query_selector('input[type="file"]')
-            if not file_input:
-                # Try to click the upload button to reveal the file dialog
-                upload_btn = await page.query_selector(
-                    'button:has-text("Select"), button:has-text("Upload"), '
-                    '[data-e2e="upload-button"]'
-                )
-                if upload_btn:
-                    await upload_btn.click()
-                    await asyncio.sleep(2)
-                    file_input = await page.query_selector('input[type="file"]')
+        await self._upload_media(page, file_paths)
+        await self._dismiss_split_window(page)
 
-            if not file_input:
-                result["error"] = "Could not find file upload input"
-                logger.error(f"[Account {account_id}] {result['error']}")
-                return result
+        full_caption = _format_caption(caption, hashtags)
+        if full_caption:
+            await self._set_caption(page, full_caption)
+            await asyncio.sleep(1)
 
-            # Get image files
-            img_dir = Path(images_dir)
-            image_files = sorted(img_dir.glob("slide_*.png")) + sorted(img_dir.glob("*.jpg"))
-            if not image_files:
-                result["error"] = f"No images found in {images_dir}"
-                logger.error(f"[Account {account_id}] {result['error']}")
-                return result
+        await self._set_interactivity(page)
 
-            # Upload files (limit to first few for slideshow)
-            upload_files = image_files[:10]  # TikTok allows up to 10 slides
-            file_paths = [str(f) for f in upload_files]
+        if cover_path:
+            await self._set_cover(page, cover_path)
 
-            # Set the file input value
-            # For multiple files, we need to set them one by one
-            await file_input.set_input_files(file_paths[0])
-            await asyncio.sleep(2)
+        if schedule_dt:
+            try:
+                await self._set_schedule(page, schedule_dt)
+            except ScheduleInvalidError:
+                raise
+            except Exception as e:
+                logger.warning(f"[Account {account_id}] Schedule UI failed: {e}")
 
-            if len(file_paths) > 1:
-                # Add remaining files
-                for fp in file_paths[1:]:
-                    try:
-                        add_btn = await page.query_selector(
-                            'button:has-text("Add more"), [data-e2e="add-more"]'
-                        )
-                        if add_btn:
-                            await add_btn.click()
-                            await asyncio.sleep(1)
-                            file_input = await page.query_selector('input[type="file"]')
-                            if file_input:
-                                await file_input.set_input_files(fp)
-                                await asyncio.sleep(1)
-                    except Exception as e:
-                        logger.warning(f"[Account {account_id}] Failed to add file {fp}: {e}")
+        if not await self._click_post(page):
+            raise PostRejectedError("Could not find Post button")
 
-            logger.info(f"[Account {account_id}] Uploaded {len(file_paths)} images")
-            await asyncio.sleep(3)
-
-            # Wait for upload processing
-            await asyncio.sleep(5)
-
-            # Enter caption
-            caption_input = await page.query_selector(
-                '[data-e2e="caption-input"], textarea, '
-                '[contenteditable="true"], [placeholder*="caption"]'
-            )
-            if caption_input:
-                full_caption = caption
-                if hashtags:
-                    tag_str = " ".join([f"#{t.strip()}" for t in hashtags.split()])
-                    full_caption = f"{caption}\n\n{tag_str}" if caption else tag_str
-
-                await caption_input.click()
-                await asyncio.sleep(0.5)
-                await caption_input.fill("")
-                await asyncio.sleep(0.3)
-
-                # Type caption like a human
-                for char in full_caption:
-                    await caption_input.type(char, delay=random.uniform(10, 50) / 1000)
-                logger.info(f"[Account {account_id}] Caption entered ({len(full_caption)} chars)")
-
-            await asyncio.sleep(2)
-
-            # Enter affiliate link if provided
-            if affiliate_link:
-                try:
-                    # Look for affiliate link input
-                    affiliate_input = await page.query_selector(
-                        'input[placeholder*="link"], input[placeholder*="Link"], '
-                        '[data-e2e="affiliate-input"]'
-                    )
-                    if affiliate_input:
-                        await affiliate_input.fill(affiliate_link)
-                        logger.info(f"[Account {account_id}] Affiliate link entered")
-                        await asyncio.sleep(1)
-                except Exception as e:
-                    logger.warning(f"[Account {account_id}] Failed to enter affiliate link: {e}")
-
-            # Post the video
-            post_btn = await page.query_selector(
-                'button:has-text("Post"), button:has-text("Upload"), '
-                '[data-e2e="post-button"], button:has-text("Submit")'
-            )
-
-            if post_btn:
-                await post_btn.click()
-                logger.info(f"[Account {account_id}] Post button clicked, waiting for upload...")
-
-                # Wait for upload to complete (may take a while)
-                await asyncio.sleep(10)
-
-                # Check for success indicators
-                success_elem = await page.query_selector(
-                    '[data-e2e="upload-success"], [class*="success"], '
-                    'text=Your video is being posted'
-                )
-                if success_elem:
-                    logger.info(f"[Account {account_id}] Upload appears successful")
-
-                result["success"] = True
-                result["posted_at"] = datetime.now().isoformat()
-                result["tiktok_post_id"] = await self._extract_post_id(page)
-                await self._persist_session(account_id, page)
-                logger.info(f"[Account {account_id}] Slideshow posted successfully!")
-            else:
-                result["error"] = "Could not find Post button"
-                logger.error(f"[Account {account_id}] {result['error']}")
-
-        except Exception as e:
-            result["error"] = str(e)
-            logger.error(f"[Account {account_id}] Upload error: {e}", exc_info=True)
-
-        # Cleanup
-        try:
-            await self.browser.close_context(account_id)
-        except Exception as e:
-            logger.warning(f"[Account {account_id}] Cleanup error: {e}")
-
+        await self._wait_post_confirmation(page)
+        result["success"] = True
+        result["posted_at"] = datetime.now().isoformat()
+        result["tiktok_post_id"] = await self._extract_post_id(page)
+        result["post_url"] = page.url if "/video/" in page.url else None
+        await self._persist_session(account_id, page)
         return result
 
     async def upload_video(
@@ -360,141 +455,188 @@ class PostEngine:
         password: str = "",
         cookie_data: Optional[str] = None,
         proxy_url: Optional[str] = None,
+        schedule_dt: Optional[datetime] = None,
+        cover_path: Optional[str] = None,
+        max_retries: int = 2,
     ) -> Dict:
-        """Upload a single mp4 video to TikTok."""
-        logger.info(f"[Account {account_id}] Starting video upload from {video_path}")
+        """Upload a single video (mp4)."""
+        video_file = Path(video_path)
+        if not video_file.is_file():
+            return {"success": False, "error": f"Video not found: {video_path}", "media_type": "video"}
 
-        result = {
+        if schedule_dt:
+            ok, msg = validate_schedule(schedule_dt)
+            if not ok:
+                return {"success": False, "error": msg, "error_type": "schedule_invalid"}
+
+        return await self._upload_with_retry(
+            account_id=account_id,
+            file_paths=[str(video_file.resolve())],
+            caption=caption,
+            hashtags=hashtags,
+            affiliate_link=affiliate_link,
+            username=username,
+            password=password,
+            cookie_data=cookie_data,
+            proxy_url=proxy_url,
+            schedule_dt=schedule_dt,
+            cover_path=cover_path,
+            max_retries=max_retries,
+            media_type="video",
+        )
+
+    async def upload_slideshow(
+        self,
+        account_id: int,
+        images_dir: str,
+        caption: str = "",
+        hashtags: str = "",
+        affiliate_link: str = "",
+        username: str = "",
+        password: str = "",
+        cookie_data: Optional[str] = None,
+        proxy_url: Optional[str] = None,
+        schedule_dt: Optional[datetime] = None,
+        cover_path: Optional[str] = None,
+        max_retries: int = 2,
+    ) -> Dict:
+        """Upload multiple images as a slideshow."""
+        img_dir = Path(images_dir)
+        patterns = ["*.png", "*.jpg", "*.jpeg", "slide_*.png"]
+        image_files: List[Path] = []
+        for pat in patterns:
+            image_files.extend(img_dir.glob(pat))
+        image_files = sorted(set(image_files))[:10]
+        if not image_files:
+            return {"success": False, "error": f"No images found in {images_dir}"}
+
+        file_paths = [str(f.resolve()) for f in image_files]
+        if schedule_dt:
+            ok, msg = validate_schedule(schedule_dt)
+            if not ok:
+                return {"success": False, "error": msg, "error_type": "schedule_invalid"}
+
+        return await self._upload_with_retry(
+            account_id=account_id,
+            file_paths=file_paths,
+            caption=caption,
+            hashtags=hashtags,
+            affiliate_link=affiliate_link,
+            username=username,
+            password=password,
+            cookie_data=cookie_data,
+            proxy_url=proxy_url,
+            schedule_dt=schedule_dt,
+            cover_path=cover_path or (str(image_files[0]) if image_files else None),
+            max_retries=max_retries,
+            media_type="slideshow",
+        )
+
+    async def _upload_with_retry(
+        self,
+        account_id: int,
+        file_paths: List[str],
+        caption: str,
+        hashtags: str,
+        affiliate_link: str,
+        username: str,
+        password: str,
+        cookie_data: Optional[str],
+        proxy_url: Optional[str],
+        schedule_dt: Optional[datetime],
+        cover_path: Optional[str],
+        max_retries: int,
+        media_type: str,
+    ) -> Dict:
+        logger.info(f"[Account {account_id}] Starting {media_type} upload ({len(file_paths)} file(s))")
+        last_error = "Upload failed"
+
+        for attempt in range(max_retries + 1):
+            try:
+                result = await self._do_upload(
+                    account_id=account_id,
+                    file_paths=file_paths,
+                    caption=caption,
+                    hashtags=hashtags,
+                    schedule_dt=schedule_dt,
+                    cover_path=cover_path,
+                    username=username,
+                    password=password,
+                    cookie_data=cookie_data,
+                    proxy_url=proxy_url,
+                )
+                result["media_type"] = media_type
+                if affiliate_link:
+                    result["affiliate_link"] = affiliate_link
+                return result
+            except CookieExpiredError as e:
+                self.clear_login_cache(account_id)
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "error_type": "cookie_expired",
+                    "media_type": media_type,
+                }
+            except ScheduleInvalidError as e:
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "error_type": "schedule_invalid",
+                    "media_type": media_type,
+                }
+            except UploadTimeoutError as e:
+                last_error = str(e)
+                if attempt < max_retries:
+                    await asyncio.sleep(10 * (attempt + 1))
+                    continue
+            except PostRejectedError as e:
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "error_type": "rejected",
+                    "media_type": media_type,
+                }
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"[Account {account_id}] Upload attempt {attempt + 1}: {e}", exc_info=True)
+                if attempt < max_retries:
+                    await asyncio.sleep(5 * (attempt + 1))
+                    continue
+            finally:
+                try:
+                    await self.browser.close_context(account_id)
+                except Exception:
+                    pass
+
+        return {
             "success": False,
-            "post_id": None,
-            "error": None,
-            "posted_at": None,
-            "media_type": "video",
+            "error": f"Upload timeout after retries: {last_error}",
+            "error_type": "timeout",
+            "media_type": media_type,
         }
 
-        video_file = Path(video_path)
-        if not video_file.exists():
-            result["error"] = f"Video not found: {video_path}"
-            return result
-
-        try:
-            page = await self.browser.get_page(account_id, proxy_url)
-            logged_in = await self._ensure_login(
-                page, account_id, username, password, cookie_data
-            )
-            if not logged_in:
-                result["error"] = "Login failed"
-                return result
-
-            await self.browser.navigate_safe(page, self.UPLOAD_URL)
-            await asyncio.sleep(5)
-
-            file_input = await page.query_selector('input[type="file"]')
-            if not file_input:
-                upload_btn = await page.query_selector(
-                    'button:has-text("Select"), [data-e2e="upload-button"]'
-                )
-                if upload_btn:
-                    await upload_btn.click()
-                    await asyncio.sleep(2)
-                    file_input = await page.query_selector('input[type="file"]')
-
-            if not file_input:
-                result["error"] = "Could not find file upload input"
-                return result
-
-            await file_input.set_input_files(str(video_file.resolve()))
-            logger.info(f"[Account {account_id}] Video file selected")
-            await asyncio.sleep(8)
-
-            caption_input = await page.query_selector(
-                '[data-e2e="caption-input"], textarea, [contenteditable="true"]'
-            )
-            if caption_input:
-                full_caption = caption
-                if hashtags:
-                    tag_str = " ".join([f"#{t.strip()}" for t in hashtags.split()])
-                    full_caption = f"{caption}\n\n{tag_str}" if caption else tag_str
-                await caption_input.click()
-                await asyncio.sleep(0.5)
-                try:
-                    await caption_input.fill(full_caption)
-                except Exception:
-                    await caption_input.type(full_caption, delay=20)
-
-            if affiliate_link:
-                try:
-                    affiliate_input = await page.query_selector(
-                        'input[placeholder*="link"], [data-e2e="affiliate-input"]'
-                    )
-                    if affiliate_input:
-                        await affiliate_input.fill(affiliate_link)
-                except Exception as e:
-                    logger.warning(f"[Account {account_id}] Affiliate link: {e}")
-
-            await asyncio.sleep(2)
-            post_btn = await page.query_selector(
-                'button:has-text("Post"), [data-e2e="post-button"]'
-            )
-            if post_btn:
-                await post_btn.click()
-                await asyncio.sleep(12)
-                result["success"] = True
-                result["posted_at"] = datetime.now().isoformat()
-                result["tiktok_post_id"] = await self._extract_post_id(page)
-                await self._persist_session(account_id, page)
-            else:
-                result["error"] = "Could not find Post button"
-
-        except Exception as e:
-            result["error"] = str(e)
-            logger.error(f"[Account {account_id}] Video upload error: {e}", exc_info=True)
-        finally:
-            try:
-                await self.browser.close_context(account_id)
-            except Exception as e:
-                logger.warning(f"[Account {account_id}] Cleanup: {e}")
-
-        return result
-
     async def get_post_stats(self, account_id: int, post_url: str) -> Optional[Dict]:
-        """Get stats for an existing post (views, likes, comments, shares)."""
         try:
             page = await self.browser.get_page(account_id)
-            success = await self.browser.navigate_safe(page, post_url)
-            if not success:
+            if not await self.browser.navigate_safe(page, post_url):
                 return None
-
             await asyncio.sleep(5)
-
-            # Try to extract stats (selectors may vary)
             stats = {}
-
-            views_elem = await page.query_selector('[data-e2e="video-views"], [class*="view-count"]')
-            if views_elem:
-                stats["views"] = await views_elem.inner_text()
-
-            likes_elem = await page.query_selector('[data-e2e="like-count"], [class*="like-count"]')
-            if likes_elem:
-                stats["likes"] = await likes_elem.inner_text()
-
-            comments_elem = await page.query_selector('[data-e2e="comment-count"], [class*="comment-count"]')
-            if comments_elem:
-                stats["comments"] = await comments_elem.inner_text()
-
-            shares_elem = await page.query_selector('[data-e2e="share-count"], [class*="share-count"]')
-            if shares_elem:
-                stats["shares"] = await shares_elem.inner_text()
-
-            logger.info(f"[Account {account_id}] Post stats: {stats}")
+            for key, sel in (
+                ("views", '[data-e2e="video-views"]'),
+                ("likes", '[data-e2e="like-count"]'),
+                ("comments", '[data-e2e="comment-count"]'),
+                ("shares", '[data-e2e="share-count"]'),
+            ):
+                el = await page.query_selector(sel)
+                if el:
+                    stats[key] = await el.inner_text()
             return stats
-
         except Exception as e:
-            logger.error(f"[Account {account_id}] Failed to get post stats: {e}")
+            logger.error(f"[Account {account_id}] get_post_stats: {e}")
             return None
 
     async def _extract_post_id(self, page) -> Optional[str]:
-        """Try to read TikTok post id from URL after upload."""
         try:
             url = page.url
             if "/video/" in url:
@@ -504,8 +646,7 @@ class PostEngine:
         return None
 
     def clear_login_cache(self, account_id: Optional[int] = None):
-        """Clear cached login state for an account (or all accounts)."""
-        if account_id:
+        if account_id is not None:
             self._login_cache.pop(account_id, None)
         else:
             self._login_cache.clear()
