@@ -100,7 +100,7 @@ class AppState:
         self.proxy_manager = ProxyManager.from_settings(settings)
         self.account_manager = AccountManager(db=self.db)
         self.browser_manager = BrowserManager.from_settings(settings)
-        self.farm_engine = FarmEngine(self.browser_manager)
+        self.farm_engine = FarmEngine(self.browser_manager, account_manager=self.account_manager)
         self.content_pipeline = ContentPipeline.from_settings(settings)
         self.post_engine = PostEngine(self.browser_manager, self.account_manager)
         self.session_service = SessionService(self.account_manager, self.proxy_manager)

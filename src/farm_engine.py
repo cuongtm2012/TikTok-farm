@@ -35,8 +35,9 @@ class FarmEngine:
     Each session mimics real user behavior with random timing and actions.
     """
 
-    def __init__(self, browser_manager):
+    def __init__(self, browser_manager, account_manager=None):
         self.browser = browser_manager
+        self.account_mgr = account_manager
         self._running = False
 
     async def _random_delay(self, min_s: float = 0.5, max_s: float = 3.0):
@@ -563,6 +564,17 @@ class FarmEngine:
             session_stats["error"] = str(e)
         finally:
             self._running = False
+            # Save cookies to DB before cleanup
+            try:
+                if self.account_mgr and account_id in self.browser._pages:
+                    page = self.browser._pages.get(account_id)
+                    if page and not page.is_closed():
+                        cookies = await page.context.cookies()
+                        if cookies:
+                            self.account_mgr.save_cookies(account_id, cookies)
+                            logger.info(f"[Account {account_id}] Saved {len(cookies)} cookies to DB")
+            except Exception as e:
+                logger.warning(f"[Account {account_id}] Save cookies error: {e}")
             # Clean up browser context
             try:
                 await self.browser.close_context(account_id)

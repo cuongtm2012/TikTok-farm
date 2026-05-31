@@ -45,6 +45,19 @@ class HealthMonitor:
 
         try:
             page = await self.browser.get_page(account_id, proxy_url)
+
+            # Inject cookies from DB if available (beyond storage_state)
+            try:
+                account = self.account_mgr.get_account(account_id)
+                if account and hasattr(account, 'cookie_data') and account.cookie_data:
+                    import json
+                    cookies = json.loads(account.cookie_data)
+                    if isinstance(cookies, list) and len(cookies) > 0:
+                        await page.context.add_cookies(cookies)
+                        logger.info(f"[Account {account_id}] Injected {len(cookies)} cookies from DB")
+            except Exception as e:
+                logger.warning(f"[Account {account_id}] Cookie inject failed: {e}")
+
             success = await self.browser.navigate_safe(page, "https://www.tiktok.com/")
             if not success:
                 result["error"] = "Failed to load TikTok"
