@@ -15,7 +15,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 try:
-    from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File, Body, WebSocket, WebSocketDisconnect
+    from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File, Form, Body, WebSocket, WebSocketDisconnect
     from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, FileResponse
     from pydantic import BaseModel, Field
     FASTAPI_AVAILABLE = True
@@ -114,6 +114,54 @@ def _account_proxy_url(state, account) -> Optional[str]:
 
 
 PREVIEW_ROOT = Path("data/previews")
+UPLOAD_ROOT = Path("data/uploads")
+ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv"}
+
+
+async def _save_uploaded_images(account_id: int, files: List[UploadFile]) -> Path:
+    """Save slideshow images to a per-upload directory."""
+    dest = UPLOAD_ROOT / "slideshows" / str(account_id) / str(int(time.time()))
+    dest.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for i, uf in enumerate(files):
+        if not uf or not uf.filename:
+            continue
+        ext = Path(uf.filename).suffix.lower()
+        if ext not in ALLOWED_IMAGE_SUFFIXES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported image type: {ext or uf.filename}",
+            )
+        data = await uf.read()
+        if not data:
+            continue
+        name = f"slide_{saved + 1:02d}{ext}"
+        (dest / name).write_bytes(data)
+        saved += 1
+    if saved == 0:
+        raise HTTPException(status_code=400, detail="No valid image files uploaded")
+    return dest
+
+
+async def _save_uploaded_video(account_id: int, upload: UploadFile) -> str:
+    """Save a single video file and return its path."""
+    if not upload or not upload.filename:
+        raise HTTPException(status_code=400, detail="Video file required")
+    ext = Path(upload.filename).suffix.lower()
+    if ext not in ALLOWED_VIDEO_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported video type: {ext or upload.filename}",
+        )
+    dest_dir = UPLOAD_ROOT / "videos" / str(account_id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    path = dest_dir / f"video_{int(time.time())}{ext}"
+    data = await upload.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty video file")
+    path.write_bytes(data)
+    return str(path)
 
 
 def _emit_session(state, session_id: str, event_type: str, account_id: int, data: dict):
@@ -540,8 +588,9 @@ async def delete_account_cookies(request: Request, account_id: int):
 def _profile_proxy_url(state, proxy_id: int) -> Optional[str]:
     if not proxy_id:
         return None
-    proxy_obj = state.proxy_manager.get_proxy(proxy_id)
-    if proxy_obj and proxy_obj.is_alive:
+    state.proxy_manager.apply_db_ids_from_db(state.db)
+    proxy_obj = state.proxy_manager.get_proxy_by_db_id(proxy_id)
+    if proxy_obj:
         return proxy_obj.url
     return None
 
@@ -552,6 +601,7 @@ def _apply_profile_scan_to_account(state, account_id: int, result: dict):
         return None
     state.account_manager.update_account(
         account_id,
+        display_name=(result.get("display_name") or "").strip(),
         followers=result.get("followers", 0),
         following=result.get("following", 0),
         total_posts=result.get("total_posts", 0),
@@ -609,7 +659,9 @@ async def sync_account_profile(request: Request, account_id: int):
         raise HTTPException(status_code=404, detail="Account not found")
 
     proxy_url = _profile_proxy_url(state, account.proxy_id)
-    result = await state.profile_scanner.fetch_profile(account.username, proxy_url=proxy_url)
+    result = await state.profile_scanner.fetch_profile(
+        account.username, proxy_url=proxy_url, account_id=account_id
+    )
     if not result.get("success"):
         _profile_scan_http_error(result)
     updated = _apply_profile_scan_to_account(state, account_id, result)
@@ -630,7 +682,9 @@ async def sync_all_account_profiles(request: Request):
     for acc in accounts:
         try:
             proxy_url = _profile_proxy_url(state, acc.proxy_id)
-            result = await state.profile_scanner.fetch_profile(acc.username, proxy_url=proxy_url)
+            result = await state.profile_scanner.fetch_profile(
+                acc.username, proxy_url=proxy_url, account_id=acc.id
+            )
             if result.get("success") and not result.get("private_account"):
                 _apply_profile_scan_to_account(state, acc.id, result)
                 results["synced"] += 1
@@ -666,14 +720,16 @@ async def sync_all_account_profiles(request: Request):
 
 @router.get("/proxies")
 async def list_proxies(request: Request):
-    """List all proxies."""
+    """List all proxies with account usage."""
     state = get_state(request)
     try:
+        state.proxy_manager.apply_db_ids_from_db(state.db)
+        usage = state.proxy_manager.get_usage_map(state.db)
         proxies = state.proxy_manager.get_all_proxies()
         return {
             "success": True,
             "count": len(proxies),
-            "proxies": [p.to_dict() for p in proxies],
+            "proxies": [p.to_dict(used_by=usage.get(p.id, [])) for p in proxies],
         }
     except Exception as e:
         logger.error(f"Error listing proxies: {e}")
@@ -777,15 +833,119 @@ async def template_proxies_csv():
 
 
 @router.post("/proxies/check")
+@router.post("/proxies/check-all")
 async def check_proxies(request: Request):
-    """Check health of all proxies."""
+    """Check health of all proxies (real HTTP to TikTok)."""
     state = get_state(request)
     try:
+        state.proxy_manager.apply_db_ids_from_db(state.db)
         results = await state.proxy_manager.check_all_proxies()
+        state.proxy_manager.persist_proxy_status_to_db(state.db)
         return {"success": True, "results": results}
     except Exception as e:
         logger.error(f"Error checking proxies: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/proxies/{proxy_id}/check")
+async def check_single_proxy(request: Request, proxy_id: int):
+    """Check one proxy and update its status."""
+    state = get_state(request)
+    proxy = state.proxy_manager.get_proxy_by_db_id(proxy_id)
+    if not proxy:
+        raise HTTPException(status_code=404, detail="Proxy not found")
+    try:
+        alive = await state.proxy_manager.check_proxy(proxy)
+        state.proxy_manager.persist_proxy_status_to_db(state.db)
+        return {"success": True, "alive": alive, "proxy": proxy.to_dict()}
+    except Exception as e:
+        logger.error(f"Error checking proxy {proxy_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/proxies/sync")
+async def sync_proxies_from_csv(request: Request):
+    """Re-sync proxy pool from proxies.csv; remove orphans; migrate accounts."""
+    state = get_state(request)
+    try:
+        stats = state.proxy_manager.reload_from_csv_and_sync(
+            state.db, account_manager=state.account_manager
+        )
+        return {"success": True, "stats": stats}
+    except Exception as e:
+        logger.error(f"Proxy sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/proxies/rebalance")
+async def rebalance_proxy_assignments(request: Request):
+    """Assign each account to a live proxy (prefer HTTP on same IP)."""
+    state = get_state(request)
+    try:
+        stats = state.proxy_manager.rebalance_accounts_to_live_proxies(
+            state.db, state.account_manager
+        )
+        return {"success": True, "stats": stats}
+    except Exception as e:
+        logger.error(f"Proxy rebalance failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---- Account logs (SPEC v5) ----
+
+
+@router.get("/accounts/{account_id}/logs")
+async def get_account_logs(
+    request: Request,
+    account_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    log_type: Optional[str] = Query(None),
+    level: Optional[str] = Query(None),
+):
+    state = get_state(request)
+    account = state.account_manager.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    logs = state.log_manager.get_logs(
+        account_id=account_id, limit=limit, log_type=log_type, level=level
+    )
+    return {"success": True, "count": len(logs), "logs": logs}
+
+
+@router.delete("/accounts/{account_id}/logs")
+async def clear_account_logs(request: Request, account_id: int):
+    state = get_state(request)
+    deleted = state.log_manager.clear_logs(account_id)
+    return {"success": True, "deleted": deleted}
+
+
+@router.get("/logs/recent")
+async def get_recent_logs(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    account_id: Optional[int] = Query(None),
+):
+    state = get_state(request)
+    if account_id is not None:
+        logs = state.log_manager.get_logs(account_id=account_id, limit=limit)
+    else:
+        logs = state.log_manager.get_logs(limit=limit)
+    return {"success": True, "count": len(logs), "logs": logs}
+
+
+@router.websocket("/logs/{account_id}")
+async def account_logs_websocket(websocket: WebSocket, account_id: int):
+    """Real-time log stream for one account."""
+    await websocket.accept()
+    state = websocket.app.state.farm
+    account = state.account_manager.get_account(account_id)
+    if not account:
+        await websocket.close(code=4404)
+        return
+    try:
+        await state.log_manager.subscribe(account_id, websocket)
+    except Exception as e:
+        logger.warning(f"Logs WS {account_id} closed: {e}")
 
 
 # ---- Performance Endpoints ----
@@ -1231,33 +1391,275 @@ async def trigger_post(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/actions/upload/video/{account_id}")
-async def upload_video_post(
+@router.post("/actions/post/{account_id}/slideshow-files")
+async def post_slideshow_files(
     request: Request,
     account_id: int,
-    body: VideoUploadBody = Body(...),
+    files: List[UploadFile] = File(...),
+    caption: str = Form(""),
+    hashtags: str = Form("fyp foryou viral"),
+    affiliate_link: str = Form(""),
+    background: bool = Query(True, description="Run in background with WebSocket progress"),
 ):
-    """Upload an mp4 video file to TikTok."""
+    """Upload slideshow images from browser and post to TikTok."""
     state = get_state(request)
     try:
         account = state.account_manager.get_account(account_id)
         if not account:
             raise HTTPException(status_code=404, detail="Account not found")
 
+        images_dir = str(await _save_uploaded_images(account_id, files))
+        body = PostComposeBody(
+            caption=caption,
+            hashtags=hashtags,
+            affiliate_link=affiliate_link,
+            images_dir=images_dir,
+        )
+
+        if background:
+            if account_id in state.active_post_tasks:
+                raise HTTPException(status_code=409, detail="Post already in progress for this account")
+            session_id = f"post_{account_id}_{int(time.time())}"
+            state.event_bus.create_session(session_id)
+            state.active_post_tasks[account_id] = session_id
+            asyncio.create_task(_run_post_upload(state, account_id, body, session_id))
+            return {
+                "success": True,
+                "message": f"Slideshow upload started for account {account_id}",
+                "session_id": session_id,
+                "ws_url": f"/api/ws/{session_id}",
+                "images_dir": images_dir,
+            }
+
+        session_id = f"post_{account_id}_{int(time.time())}"
+        state.event_bus.create_session(session_id)
+        await _run_post_upload(state, account_id, body, session_id)
+        return {
+            "success": True,
+            "message": "Slideshow posted",
+            "session_id": session_id,
+            "images_dir": images_dir,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error posting slideshow files for {account_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/actions/post/{account_id}/batch-schedule")
+async def batch_schedule_posts(
+    request: Request,
+    account_id: int,
+    folder_path: str = Form(""),
+    posts_per_day: int = Form(3),
+    time_slots: str = Form(""),
+    start_date: str = Form(""),
+    caption_template: str = Form("Video {n}"),
+    hashtags: str = Form("fyp foryou viral"),
+    affiliate_link: str = Form(""),
+    files: Optional[List[UploadFile]] = File(None),
+):
+    """
+    Queue many videos for daily posting at configured time slots.
+    Videos are published automatically when scheduled_at is due (scheduler, every 1 min).
+    """
+    from src.batch_post_scheduler import build_post_schedule, scan_video_files
+
+    state = get_state(request)
+    account = state.account_manager.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    posts_per_day = max(1, min(int(posts_per_day), 10))
+    video_paths: List[Path] = []
+
+    folder = folder_path.strip()
+    if folder:
+        src = Path(folder).expanduser()
+        if not src.is_dir():
+            raise HTTPException(status_code=400, detail=f"Folder not found: {folder}")
+        video_paths = scan_video_files(src)
+
+    upload_list = [f for f in (files or []) if f and f.filename]
+    if upload_list:
+        batch_dir = UPLOAD_ROOT / "batch" / str(account_id) / str(int(time.time()))
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        for i, uf in enumerate(upload_list, start=1):
+            ext = Path(uf.filename).suffix.lower()
+            if ext not in ALLOWED_VIDEO_SUFFIXES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported video: {uf.filename}",
+                )
+            data = await uf.read()
+            if not data:
+                continue
+            dest = batch_dir / f"video_{i:03d}{ext}"
+            dest.write_bytes(data)
+            video_paths.append(dest)
+
+    if not video_paths:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide a server folder_path or upload video files",
+        )
+
+    sched_cfg = state.settings.get("scheduler", {})
+    slots = sched_cfg.get("post_time_slots") or [
+        ["08:00", "11:00"],
+        ["14:00", "17:00"],
+        ["19:00", "22:00"],
+    ]
+    if time_slots.strip():
+        try:
+            parsed = json.loads(time_slots)
+            if isinstance(parsed, list) and parsed:
+                slots = parsed
+        except json.JSONDecodeError:
+            lines = [ln.strip() for ln in time_slots.splitlines() if ln.strip()]
+            parsed_slots = []
+            for ln in lines:
+                sep = "-" if "-" in ln else ","
+                parts = [p.strip() for p in ln.split(sep, 1)]
+                if len(parts) == 2:
+                    parsed_slots.append(parts)
+            if parsed_slots:
+                slots = parsed_slots
+
+    start_dt = None
+    if start_date.strip():
+        try:
+            start_dt = datetime.strptime(start_date.strip()[:10], "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="start_date must be YYYY-MM-DD")
+
+    schedule_times = build_post_schedule(
+        len(video_paths),
+        posts_per_day,
+        slots,
+        start_dt,
+    )
+
+    queued = []
+    for i, (vpath, sched) in enumerate(zip(video_paths, schedule_times), start=1):
+        caption = (
+            caption_template.replace("{n}", str(i))
+            .replace("{name}", vpath.stem)
+            .replace("{file}", vpath.name)
+        )
+        post_id = state.account_manager.add_post(
+            account_id,
+            str(vpath),
+            caption,
+            hashtags,
+            affiliate_link,
+            scheduled_at=sched.isoformat(),
+        )
+        if post_id:
+            queued.append({
+                "post_id": post_id,
+                "file": vpath.name,
+                "scheduled_at": sched.isoformat(),
+                "caption": caption,
+            })
+
+    if not queued:
+        raise HTTPException(status_code=500, detail="Failed to queue posts")
+
+    first = queued[0]["scheduled_at"]
+    last = queued[-1]["scheduled_at"]
+    days_span = max(1, (schedule_times[-1].date() - schedule_times[0].date()).days + 1)
+
+    return {
+        "success": True,
+        "message": f"Queued {len(queued)} videos for @{account.username}",
+        "count": len(queued),
+        "posts_per_day": posts_per_day,
+        "time_slots": slots,
+        "first_scheduled_at": first,
+        "last_scheduled_at": last,
+        "estimated_days": days_span,
+        "queue": queued,
+    }
+
+
+@router.get("/actions/post/{account_id}/batch-queue")
+async def batch_queue_status(
+    request: Request,
+    account_id: int,
+    limit: int = Query(50, ge=1, le=200),
+):
+    """List pending scheduled posts for an account."""
+    state = get_state(request)
+    rows = state.account_manager.list_posts(
+        account_id=account_id, limit=limit, status="pending"
+    )
+    pending = sorted(
+        [r for r in rows if r.get("scheduled_at")],
+        key=lambda r: r.get("scheduled_at") or "",
+    )
+    return {
+        "success": True,
+        "count": len(pending),
+        "pending": [
+            {
+                "id": r.get("id"),
+                "file": Path(r.get("content_path") or "").name,
+                "scheduled_at": r.get("scheduled_at"),
+                "caption": r.get("caption"),
+                "status": r.get("status"),
+            }
+            for r in pending
+        ],
+    }
+
+
+@router.post("/actions/upload/video/{account_id}")
+async def upload_video_post(request: Request, account_id: int):
+    """Upload a video file (multipart) or post from server path (JSON)."""
+    state = get_state(request)
+    try:
+        account = state.account_manager.get_account(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+
+        content_type = (request.headers.get("content-type") or "").lower()
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            upload = form.get("file")
+            if not upload or not hasattr(upload, "read"):
+                raise HTTPException(status_code=400, detail="Video file required")
+            video_path = await _save_uploaded_video(account_id, upload)
+            caption = str(form.get("caption") or "")
+            hashtags = str(form.get("hashtags") or "fyp foryou viral")
+            affiliate_link = str(form.get("affiliate_link") or "")
+        else:
+            data = await request.json()
+            body = VideoUploadBody(**data)
+            video_path = body.video_path.strip()
+            if not video_path:
+                raise HTTPException(status_code=400, detail="video_path required")
+            if not Path(video_path).is_file():
+                raise HTTPException(status_code=400, detail="Video file not found on server")
+            caption = body.caption
+            hashtags = body.hashtags
+            affiliate_link = body.affiliate_link
+
         proxy = _account_proxy_url(state, account)
         post_id = state.account_manager.add_post(
             account_id,
-            body.video_path,
-            body.caption,
-            body.hashtags,
-            body.affiliate_link,
+            video_path,
+            caption,
+            hashtags,
+            affiliate_link,
         )
         result = await state.post_engine.upload_video(
             account_id=account_id,
-            video_path=body.video_path,
-            caption=body.caption or "",
-            hashtags=body.hashtags or "fyp foryou viral",
-            affiliate_link=body.affiliate_link,
+            video_path=video_path,
+            caption=caption or "",
+            hashtags=hashtags or "fyp foryou viral",
+            affiliate_link=affiliate_link,
             username=account.username,
             password=account.password or "",
             cookie_data=account.cookie_data,
@@ -1289,7 +1691,9 @@ async def sync_profile(request: Request, account_id: int):
             raise HTTPException(status_code=503, detail="Profile scanner not ready (install Playwright)")
 
         proxy_url = _profile_proxy_url(state, account.proxy_id)
-        result = await state.profile_scanner.fetch_profile(account.username, proxy_url=proxy_url)
+        result = await state.profile_scanner.fetch_profile(
+            account.username, proxy_url=proxy_url, account_id=account_id
+        )
         if not result.get("success"):
             _profile_scan_http_error(result)
 
@@ -1297,6 +1701,7 @@ async def sync_profile(request: Request, account_id: int):
         updates = {}
         if updated:
             updates = {
+                "display_name": result.get("display_name") or "",
                 "followers": result.get("followers", 0),
                 "following": result.get("following", 0),
                 "total_posts": result.get("total_posts", 0),
@@ -1317,7 +1722,9 @@ async def trigger_check(request: Request, account_id: int):
     state = get_state(request)
     try:
         result = await state.health_monitor.check_account(account_id)
-        return {"success": True, "result": result}
+        message = state.health_monitor.summarize_check_result(result)
+        ok = bool((result.get("login") or {}).get("logged_in"))
+        return {"success": True, "ok": ok, "message": message, "result": result}
     except Exception as e:
         logger.error(f"Error checking account {account_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))

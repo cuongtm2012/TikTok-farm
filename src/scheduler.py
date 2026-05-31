@@ -129,10 +129,24 @@ class FarmScheduler:
 
             self._schedule_health_checks()
             self._schedule_warmup_tick()
+            self._schedule_pending_post_checker()
             self._schedule_daily_jobs()
 
         except Exception as e:
             logger.error(f"Failed to start scheduler: {e}")
+
+    def _schedule_pending_post_checker(self):
+        """Publish queued batch posts when scheduled_at is due."""
+        if not self._scheduler:
+            return
+        self._scheduler.add_job(
+            self._process_due_pending_posts,
+            IntervalTrigger(minutes=1),
+            id="pending_posts_checker",
+            name="Pending batch post publisher",
+            replace_existing=True,
+        )
+        logger.info("Scheduled pending post checker (every 1 min)")
 
     def _schedule_health_checks(self):
         """Schedule periodic health checks."""
@@ -557,6 +571,105 @@ class FarmScheduler:
                     name=f"Retry {job_type} #{current} for account {account_id}",
                 )
                 logger.info(f"Rescheduled {job_type} for account {account_id} in {backoff//60} min (attempt {current}/{self._max_retries})")
+
+    async def _process_due_pending_posts(self):
+        """Upload videos/slideshows queued with scheduled_at."""
+        posts = self.account_mgr.get_due_pending_posts(limit=3)
+        if not posts:
+            return
+        for row in posts:
+            account_id = row.get("account_id")
+            post_id = row.get("id")
+            if not account_id or not post_id:
+                continue
+            if account_id in self._farm_active:
+                logger.info(f"Defer batch post {post_id}: farm active on account {account_id}")
+                continue
+            if not self.account_mgr.claim_post_for_publish(post_id):
+                continue
+            async with self._account_locks[account_id]:
+                await self._publish_scheduled_post(row)
+
+    async def _publish_scheduled_post(self, row: dict):
+        """Publish a single queued post from the batch schedule."""
+        post_id = row.get("id")
+        account_id = row.get("account_id")
+        try:
+            account = self.account_mgr.get_account(account_id)
+            if not account or account.status not in ("active", "warming"):
+                self.account_mgr.update_post(post_id, status="failed")
+                logger.warning(f"Batch post {post_id}: account {account_id} not active")
+                return
+
+            session = await self._prepare_session(account_id)
+            if not session.get("ok"):
+                self.account_mgr.update_post(post_id, status="pending")
+                logger.warning(f"Batch post {post_id}: session prep failed, reset to pending")
+                return
+
+            content_path = row.get("content_path") or ""
+            path = Path(content_path)
+            if not path.exists():
+                self.account_mgr.update_post(post_id, status="failed")
+                logger.error(f"Batch post {post_id}: missing file {content_path}")
+                return
+
+            proxy_url = session.get("proxy_url")
+            if not proxy_url and account.proxy_id and self.proxy_mgr:
+                proxy_obj = self.proxy_mgr.get_proxy(account.proxy_id)
+                if proxy_obj and proxy_obj.is_alive:
+                    proxy_url = proxy_obj.url
+
+            caption = row.get("caption") or ""
+            hashtags = row.get("hashtags") or "fyp foryou viral"
+            affiliate_link = row.get("affiliate_link") or ""
+
+            if path.is_dir():
+                result = await self.post_engine.upload_slideshow(
+                    account_id=account_id,
+                    images_dir=str(path),
+                    caption=caption,
+                    hashtags=hashtags,
+                    affiliate_link=affiliate_link,
+                    username=session.get("username") or account.username,
+                    password=session.get("password") or getattr(account, "password", ""),
+                    cookie_data=session.get("cookie_data") or account.cookie_data,
+                    proxy_url=proxy_url,
+                )
+            else:
+                result = await self.post_engine.upload_video(
+                    account_id=account_id,
+                    video_path=str(path),
+                    caption=caption,
+                    hashtags=hashtags,
+                    affiliate_link=affiliate_link,
+                    username=session.get("username") or account.username,
+                    password=session.get("password") or getattr(account, "password", ""),
+                    cookie_data=session.get("cookie_data") or account.cookie_data,
+                    proxy_url=proxy_url,
+                )
+
+            if result.get("success"):
+                self.account_mgr.mark_post_posted(
+                    post_id,
+                    tiktok_post_id=result.get("tiktok_post_id") or result.get("post_id"),
+                    views=0,
+                )
+                acc = self.account_mgr.get_account(account_id)
+                self.account_mgr.update_account(
+                    account_id,
+                    total_posts=(acc.total_posts or 0) + 1,
+                    last_active=datetime.now().isoformat(),
+                )
+                logger.info(f"Batch post {post_id} published for account {account_id}")
+            else:
+                self.account_mgr.update_post(post_id, status="failed")
+                logger.warning(
+                    f"Batch post {post_id} failed: {result.get('error', 'unknown')}"
+                )
+        except Exception as e:
+            logger.error(f"Batch post {post_id} error: {e}", exc_info=True)
+            self.account_mgr.update_post(post_id, status="failed")
 
     async def _run_health_check(self):
         """Run periodic health checks on all accounts."""

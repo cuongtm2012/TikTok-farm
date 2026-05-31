@@ -32,9 +32,11 @@ class Account:
         cookie_data: Optional[str] = None,
         password: str = "",
         notes: str = "",
+        display_name: str = "",
     ):
         self.id = account_id
         self.username = username
+        self.display_name = display_name or ""
         self.proxy_id = proxy_id
         self.password = password
         self.status = status
@@ -93,6 +95,7 @@ class Account:
         data = {
             "id": self.id,
             "username": self.username,
+            "display_name": self.display_name,
             "proxy_id": self.proxy_id,
             "status": self.status,
             "followers": self.followers,
@@ -203,11 +206,15 @@ class AccountManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-            try:
-                cursor.execute("ALTER TABLE accounts ADD COLUMN password TEXT")
-                conn.commit()
-            except Exception:
-                pass
+            for col, ddl in (
+                ("password", "ALTER TABLE accounts ADD COLUMN password TEXT"),
+                ("display_name", "ALTER TABLE accounts ADD COLUMN display_name TEXT DEFAULT ''"),
+            ):
+                try:
+                    cursor.execute(ddl)
+                    conn.commit()
+                except Exception:
+                    pass
 
             conn.commit()
             conn.close()
@@ -488,6 +495,7 @@ class AccountManager:
             total_views = profile.get("heart_count", 0)
         return self.update_account(
             account_id,
+            display_name=profile.get("display_name") or profile.get("nickname") or "",
             followers=profile.get("followers", 0),
             following=profile.get("following", 0),
             total_posts=total_posts,
@@ -498,7 +506,7 @@ class AccountManager:
     def update_account(self, account_id: int, **kwargs) -> Optional[Account]:
         """Update account fields. Returns updated Account or None."""
         allowed_fields = {
-            "username", "proxy_id", "status", "followers", "following",
+            "username", "display_name", "proxy_id", "status", "followers", "following",
             "total_posts", "total_views", "last_active", "cookie_data", "password", "notes",
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
@@ -896,6 +904,48 @@ class AccountManager:
             logger.error(f"Failed to get pending posts: {e}")
             return []
 
+    def get_due_pending_posts(self, limit: int = 5) -> List[Dict]:
+        """Pending posts whose scheduled_at is in the past (ready to publish)."""
+        try:
+            now = datetime.now().isoformat()
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                self.db.sql(
+                    "SELECT * FROM posts WHERE status = 'pending' "
+                    "AND scheduled_at IS NOT NULL AND scheduled_at <= ? "
+                    "AND content_path IS NOT NULL AND content_path != '' "
+                    "ORDER BY scheduled_at ASC LIMIT ?"
+                ),
+                (now, limit),
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"Failed to get due pending posts: {e}")
+            return []
+
+    def claim_post_for_publish(self, post_id: int) -> bool:
+        """Atomically mark pending post as publishing (avoid double upload)."""
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                self.db.sql(
+                    "UPDATE posts SET status = 'publishing' "
+                    "WHERE id = ? AND status = 'pending'"
+                ),
+                (post_id,),
+            )
+            conn.commit()
+            ok = cursor.rowcount > 0
+            conn.close()
+            return ok
+        except Exception as e:
+            logger.error(f"Failed to claim post {post_id}: {e}")
+            return False
+
     # ---- Stats ----
 
     def _scalar(self, row, key: str = "count", index: int = 0):
@@ -997,6 +1047,7 @@ class AccountManager:
             cookie_data=row["cookie_data"],
             password=row["password"] if "password" in row.keys() else "",
             notes=row["notes"] or "",
+            display_name=(row["display_name"] or "") if "display_name" in row.keys() else "",
         )
 
     @classmethod

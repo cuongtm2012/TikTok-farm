@@ -40,6 +40,7 @@ from src.health_monitor import HealthMonitor
 from src.telegram_alert import TelegramAlert
 from src.profile_scanner import ProfileScanner
 from src.cookie_manager import CookieManager
+from src.log_manager import LogManager
 from src.affiliate import AffiliatePipeline
 
 # Setup logging
@@ -98,6 +99,7 @@ class AppState:
         self.settings = settings
         self.shutdown_requested = False
         self.db = Database.from_settings(settings)
+        self.log_manager = LogManager(self.db)
 
         # Initialize components
         self.telegram = TelegramAlert.from_settings(settings)
@@ -109,6 +111,7 @@ class AppState:
             self.browser_manager,
             account_manager=self.account_manager,
             event_bus=self.event_bus,
+            log_manager=self.log_manager,
         )
         self.active_farm_tasks: dict = {}
         self.active_post_tasks: dict = {}
@@ -118,13 +121,19 @@ class AppState:
             self.browser_manager,
             self.account_manager,
             cookie_manager=self.cookie_manager,
+            log_manager=self.log_manager,
         )
         self.session_service = SessionService(self.account_manager, self.proxy_manager)
         self.warmup_manager = WarmupManager(
             self.account_manager, self.proxy_manager, settings
         )
         self.health_monitor = HealthMonitor.from_settings(
-            settings, self.account_manager, self.browser_manager, self.telegram
+            settings,
+            self.account_manager,
+            self.browser_manager,
+            self.telegram,
+            log_manager=self.log_manager,
+            proxy_manager=self.proxy_manager,
         )
         self.affiliate_pipeline = AffiliatePipeline(
             settings, self.post_engine, self.account_manager
@@ -140,7 +149,11 @@ class AppState:
             warmup_manager=self.warmup_manager,
             affiliate_pipeline=self.affiliate_pipeline,
         )
-        self.profile_scanner = ProfileScanner(self.browser_manager)
+        self.profile_scanner = ProfileScanner(
+            self.browser_manager,
+            log_manager=self.log_manager,
+            account_manager=self.account_manager,
+        )
 
         self.proxy_manager.load_from_csv()
         logger.info("All components initialized")
@@ -149,7 +162,15 @@ class AppState:
         """Start all services."""
         logger.info("Starting TikTok Farm services...")
 
-        self.proxy_manager.sync_proxies_to_db(self.db)
+        sync_stats = self.proxy_manager.sync_proxies_to_db(
+            self.db, account_manager=self.account_manager
+        )
+        logger.info(f"Proxy CSV sync on startup: {sync_stats}")
+        reb = self.proxy_manager.rebalance_accounts_to_live_proxies(
+            self.db, self.account_manager
+        )
+        if reb.get("reassigned"):
+            logger.info(f"Proxy rebalance: {reb}")
 
         if self.warmup_manager:
             tick = self.warmup_manager.run_daily_tick()

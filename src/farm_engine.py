@@ -38,23 +38,47 @@ class FarmEngine:
     Each session mimics real user behavior with random timing and actions.
     """
 
-    def __init__(self, browser_manager, account_manager=None, event_bus=None):
+    def __init__(self, browser_manager, account_manager=None, event_bus=None, log_manager=None):
         self.browser = browser_manager
         self.account_mgr = account_manager
         self.event_bus = event_bus or FarmEventBus.get_instance()
+        self.log_mgr = log_manager
         self._running = False
         self._session_id: Optional[str] = None
         self._current_account_id: Optional[int] = None
         self._session_start_ts: float = 0
 
     def _emit(self, event_type: str, data: Optional[dict] = None):
+        data = data or {}
         if self.event_bus and self._session_id:
             self.event_bus.emit(
                 self._session_id,
                 event_type,
                 account_id=self._current_account_id,
-                data=data or {},
+                data=data,
             )
+        self._log_from_event(event_type, data)
+
+    def _log_from_event(self, event_type: str, data: dict):
+        if not self.log_mgr or not self._current_account_id:
+            return
+        level = "INFO"
+        log_type = "farm"
+        if event_type == "farm:error":
+            level = "ERROR"
+            log_type = "error"
+        elif event_type == "farm:complete":
+            level = "SUCCESS"
+        elif data.get("level") in ("WARNING", "ERROR", "SUCCESS", "INFO"):
+            level = data.get("level")
+        message = data.get("message") or event_type.replace("farm:", "").replace("_", " ")
+        if event_type == "farm:complete" and data.get("stats"):
+            s = data["stats"]
+            message = (
+                f"Farm complete ({data.get('duration', 0)}s): "
+                f"{s.get('scrolls', 0)} scrolls, {s.get('likes', 0)} likes"
+            )
+        self.log_mgr.log(self._current_account_id, log_type, level, message, data)
 
     async def _random_delay(self, min_s: float = 0.5, max_s: float = 3.0):
         """Sleep for a random duration to simulate human behavior."""
@@ -67,6 +91,17 @@ class FarmEngine:
     async def _random_action_delay(self):
         """Delay between actions (like, comment, etc.)."""
         await self._random_delay(2.0, 6.0)
+
+    def _emit_progress(self, phase: str, elapsed_sec: int, **extra):
+        """Push live stats to WebSocket (dashboard live log panel)."""
+        payload = {
+            "elapsed_sec": elapsed_sec,
+            "scrolls": extra.get("scrolls", 0),
+            "videos_seen": extra.get("videos_seen", 0),
+            "phase": phase,
+        }
+        payload.update({k: v for k, v in extra.items() if k not in payload})
+        self._emit("farm:progress", payload)
 
     async def scroll_feed(
         self,
@@ -91,16 +126,20 @@ class FarmEngine:
 
         try:
             page = await self.browser.get_page(account_id, proxy_url)
+            self._emit("farm:log", {"level": "INFO", "message": "Opening TikTok For You…"})
             success = await self.browser.navigate_safe(page, target_url)
             if not success:
                 logger.warning(f"[Account {account_id}] Failed to load TikTok feed")
+                self._emit("farm:log", {"level": "WARNING", "message": "Failed to load TikTok feed"})
                 return stats
 
             # Wait for feed to load
             await asyncio.sleep(3)
+            self._emit("farm:log", {"level": "INFO", "message": "Feed loaded — scrolling…"})
 
             start_time = asyncio.get_event_loop().time()
             end_time = start_time + (duration_minutes * 60)
+            last_progress_at = start_time
 
             scroll_count = 0
             while asyncio.get_event_loop().time() < end_time:
@@ -122,6 +161,17 @@ class FarmEngine:
                 except Exception as e:
                     logger.warning(f"[Account {account_id}] Scroll failed: {e}")
 
+                now = asyncio.get_event_loop().time()
+                if scroll_count == 1 or (now - last_progress_at) >= 12:
+                    elapsed = int(now - start_time)
+                    self._emit_progress(
+                        "scroll",
+                        elapsed,
+                        scrolls=scroll_count,
+                        videos_seen=stats["videos_viewed"],
+                    )
+                    last_progress_at = now
+
                 await self._random_scroll_delay()
 
                 # Occasionally scroll up a bit (like real users)
@@ -136,6 +186,20 @@ class FarmEngine:
             stats["completed"] = True
             elapsed = int(asyncio.get_event_loop().time() - start_time)
             stats["duration_seconds"] = elapsed
+            self._emit_progress(
+                "scroll",
+                elapsed,
+                scrolls=scroll_count,
+                videos_seen=stats["videos_viewed"],
+                done=True,
+            )
+            self._emit(
+                "farm:log",
+                {
+                    "level": "SUCCESS",
+                    "message": f"Scroll done: {scroll_count} scrolls, {stats['videos_viewed']} videos",
+                },
+            )
             logger.info(f"[Account {account_id}] Scroll feed complete: {scroll_count} scrolls, {stats['videos_viewed']} videos")
 
         except Exception as e:
@@ -554,10 +618,16 @@ class FarmEngine:
                     account_id, proxy_url, duration_minutes=scroll_duration
                 )
                 session_stats["actions"]["scroll"] = scroll_stats
+                if not scroll_stats.get("completed"):
+                    raise RuntimeError(
+                        "Could not open TikTok in browser. "
+                        "Run: python3 -m playwright install chromium"
+                    )
 
             # Phase 2: Watch videos
             watch_count = actions.get("watch", 3)
             if watch_count > 0:
+                self._emit("farm:log", {"message": f"Watching {watch_count} video(s)…"})
                 watch_stats = await self.watch_video_full(
                     account_id, proxy_url, count=watch_count
                 )
@@ -569,6 +639,7 @@ class FarmEngine:
             # Phase 3: Like some videos
             like_count = actions.get("like", 3)
             if like_count > 0:
+                self._emit("farm:log", {"message": f"Liking up to {like_count} video(s)…"})
                 like_stats = await self.like_videos(
                     account_id, proxy_url, count=like_count
                 )
@@ -577,6 +648,7 @@ class FarmEngine:
             # Phase 4: Follow a few accounts (low rate)
             follow_count = actions.get("follow", 1)
             if follow_count > 0:
+                self._emit("farm:log", {"message": f"Following up to {follow_count} account(s)…"})
                 follow_stats = await self.follow_accounts(
                     account_id, proxy_url, count=follow_count
                 )
@@ -585,12 +657,14 @@ class FarmEngine:
             # Phase 5: Leave some comments
             comment_count = actions.get("comment", 1)
             if comment_count > 0:
+                self._emit("farm:log", {"message": f"Commenting on up to {comment_count} video(s)…"})
                 comment_stats = await self.comment_random(
                     account_id, proxy_url, count=comment_count
                 )
                 session_stats["actions"]["comment"] = comment_stats
 
             # Final scroll
+            self._emit("farm:log", {"message": "Final scroll (2 min)…"})
             final_scroll = await self.scroll_feed(
                 account_id, proxy_url, duration_minutes=2
             )

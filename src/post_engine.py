@@ -102,10 +102,11 @@ def _format_caption(caption: str, hashtags: str) -> str:
 class PostEngine:
     """Upload TikTok video/slideshow via Creator Center (Playwright)."""
 
-    def __init__(self, browser_manager, account_manager=None, cookie_manager=None):
+    def __init__(self, browser_manager, account_manager=None, cookie_manager=None, log_manager=None):
         self.browser = browser_manager
         self.account_mgr = account_manager
         self.cookie_mgr = cookie_manager or CookieManager()
+        self.log_mgr = log_manager
         self._login_cache: Dict[int, bool] = {}
         self.selectors = load_selectors()
         self.upload_sel = self.selectors.get("upload", {})
@@ -118,6 +119,10 @@ class PostEngine:
 
     def _upload_timeout(self) -> int:
         return int(self.upload_sel.get("upload_timeout_ms") or UPLOAD_TIMEOUT_DEFAULT_MS)
+
+    def _log_post(self, account_id: int, level: str, message: str, details: dict = None):
+        if self.log_mgr:
+            self.log_mgr.log(account_id, "post", level, message, details)
 
     async def _locator(self, page, xpath: str):
         if not xpath:
@@ -399,8 +404,9 @@ class PostEngine:
             "posted_at": None,
         }
 
+        self._log_post(account_id, "INFO", "Upload started")
         page = await self.browser.get_page(account_id, proxy_url)
-        self.browser.apply_stealth(page.context)
+        await self.browser.apply_stealth(page.context)
 
         await self._ensure_login(page, account_id, username, password, cookie_data)
 
@@ -442,6 +448,12 @@ class PostEngine:
         result["tiktok_post_id"] = await self._extract_post_id(page)
         result["post_url"] = page.url if "/video/" in page.url else None
         await self._persist_session(account_id, page)
+        self._log_post(
+            account_id,
+            "SUCCESS",
+            "Post published successfully",
+            {"post_url": result.get("post_url"), "tiktok_post_id": result.get("tiktok_post_id")},
+        )
         return result
 
     async def upload_video(
@@ -571,6 +583,7 @@ class PostEngine:
                 return result
             except CookieExpiredError as e:
                 self.clear_login_cache(account_id)
+                self._log_post(account_id, "ERROR", str(e), {"error_type": "cookie_expired"})
                 return {
                     "success": False,
                     "error": str(e),
@@ -608,6 +621,12 @@ class PostEngine:
                 except Exception:
                     pass
 
+        self._log_post(
+            account_id,
+            "ERROR",
+            f"Upload failed: {last_error}",
+            {"error_type": "timeout", "media_type": media_type},
+        )
         return {
             "success": False,
             "error": f"Upload timeout after retries: {last_error}",

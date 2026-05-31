@@ -1,6 +1,7 @@
 # TikTok Farm — Browser-based public profile scanner (no ms_token / TikTokApi)
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -86,14 +87,28 @@ def _ok(username: str, **fields) -> Dict[str, Any]:
         "display_name": fields.get("display_name", ""),
         "bio": fields.get("bio", ""),
         "avatar_url": fields.get("avatar_url", ""),
-        "followers": fields.get("followers", 0),
-        "following": fields.get("following", 0),
-        "likes": fields.get("likes", 0),
-        "total_posts": fields.get("total_posts", 0),
+        "followers": int(fields.get("followers", 0) or 0),
+        "following": int(fields.get("following", 0) or 0),
+        "likes": int(fields.get("likes", 0) or 0),
+        "total_posts": int(fields.get("total_posts", 0) or 0),
         "verified": fields.get("verified", False),
         "private_account": fields.get("private_account", False),
         "scanned_at": _utc_now(),
     }
+
+
+def _profile_stats_readable(parsed: dict, body_text: str = "") -> bool:
+    """True if we parsed a profile page (0 counts are valid — not falsy)."""
+    if parsed.get("stats_extracted") or parsed.get("_json_stats"):
+        return True
+    if any(int(parsed.get(k) or 0) > 0 for k in ("followers", "following", "likes")):
+        return True
+    # Profile header + counter labels on page (e.g. "0 Followers")
+    if parsed.get("display_name") and re.search(
+        r"\b(followers|following|likes)\b", body_text, re.I
+    ):
+        return True
+    return False
 
 
 class ProfileScanner:
@@ -102,8 +117,10 @@ class ProfileScanner:
     NAV_TIMEOUT_MS = 15_000
     MAX_RETRIES = 2
 
-    def __init__(self, browser_manager):
+    def __init__(self, browser_manager, log_manager=None, account_manager=None):
         self.browser = browser_manager
+        self.log_mgr = log_manager
+        self.account_mgr = account_manager
         self._last_scan_at: float = 0
         self._min_interval_sec = 1.0
 
@@ -136,7 +153,45 @@ class ProfileScanner:
             await asyncio.sleep(self._min_interval_sec - elapsed)
         self._last_scan_at = time.time()
 
-    async def fetch_profile(self, username: str, proxy_url: Optional[str] = None) -> Dict[str, Any]:
+    def _log_scan(self, account_id: Optional[int], result: dict):
+        if not self.log_mgr:
+            return
+        aid = account_id if account_id is not None else 0
+        if result.get("success"):
+            if result.get("private_account"):
+                self.log_mgr.log(
+                    aid,
+                    "sync",
+                    "WARNING",
+                    f"@{result.get('username')}: private account",
+                    result,
+                )
+            else:
+                self.log_mgr.log(
+                    aid,
+                    "sync",
+                    "SUCCESS",
+                    (
+                        f"Profile scanned: {result.get('followers', 0):,} followers, "
+                        f"{result.get('likes', 0):,} likes"
+                    ),
+                    result,
+                )
+        else:
+            self.log_mgr.log(
+                aid,
+                "sync",
+                "ERROR",
+                result.get("error") or "Profile scan failed",
+                result,
+            )
+
+    async def fetch_profile(
+        self,
+        username: str,
+        proxy_url: Optional[str] = None,
+        account_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
         username = (username or "").strip().lstrip("@")
         if not username:
             return _fail("", "Username is required", "not_found")
@@ -148,14 +203,22 @@ class ProfileScanner:
 
         for attempt in range(self.MAX_RETRIES):
             ua = USER_AGENTS[attempt % len(USER_AGENTS)]
-            ctx_id = _scan_context_id(f"{username}_{attempt}")
+            # Use real account browser profile + cookies when syncing a farm account
+            ctx_id = (
+                account_id
+                if account_id is not None and account_id < 900_000_000
+                else _scan_context_id(f"{username}_{attempt}")
+            )
             try:
-                result = await self._scan_once(username, proxy_url, ua, ctx_id)
+                result = await self._scan_once(
+                    username, proxy_url, ua, ctx_id, account_id=account_id
+                )
                 if result.get("success") or result.get("error_type") in (
                     "not_found",
                     "private",
                     "blocked",
                 ):
+                    self._log_scan(account_id, result)
                     return result
                 last_error = result.get("error") or last_error
                 last_type = result.get("error_type") or last_type
@@ -172,7 +235,9 @@ class ProfileScanner:
                 except Exception:
                     pass
 
-        return _fail(username, last_error, last_type)
+        fail = _fail(username, last_error, last_type)
+        self._log_scan(account_id, fail)
+        return fail
 
     async def _scan_once(
         self,
@@ -180,6 +245,7 @@ class ProfileScanner:
         proxy_url: Optional[str],
         user_agent: str,
         ctx_id: int,
+        account_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         url = f"https://www.tiktok.com/@{username}"
 
@@ -190,6 +256,21 @@ class ProfileScanner:
             extra_http_headers=BROWSER_HEADERS,
         )
         page = await context.new_page()
+
+        if account_id is not None and account_id < 900_000_000 and self.account_mgr:
+            try:
+                from src.cookie_manager import CookieManager
+
+                account = self.account_mgr.get_account(account_id)
+                if account and account.cookie_data:
+                    cookies = CookieManager.parse_cookie_string(account.cookie_data)
+                    if cookies:
+                        await context.add_cookies(cookies)
+                        logger.info(
+                            f"Profile scan: injected cookies for account {account_id}"
+                        )
+            except Exception as e:
+                logger.debug(f"Cookie inject for profile scan {account_id}: {e}")
 
         try:
             response = await page.goto(
@@ -206,7 +287,12 @@ class ProfileScanner:
                     "blocked",
                 )
 
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+
             body_text = (await page.inner_text("body")).lower() if await page.query_selector("body") else ""
 
             if self._is_cloudflare(body_text):
@@ -221,14 +307,27 @@ class ProfileScanner:
                 await page.reload(wait_until="domcontentloaded", timeout=self.NAV_TIMEOUT_MS)
                 body_text = (await page.inner_text("body")).lower() if await page.query_selector("body") else ""
 
-            final_url = page.url.lower()
-            if "/foryou" in final_url or final_url.rstrip("/").endswith("tiktok.com"):
-                if f"/@{username.lower()}" not in final_url:
-                    return _fail(
-                        username,
-                        f"Account @{username} not found or banned.",
-                        "not_found",
-                    )
+            if "log in to tiktok" in body_text or (
+                "log in" in body_text and "qr code" in body_text
+            ):
+                return _fail(
+                    username,
+                    "TikTok session expired — update cookies (sessionid) for this account.",
+                    "login_required",
+                )
+
+            if (
+                "couldn't find this account" in body_text
+                or "this page isn't available" in body_text
+                or "account has been banned" in body_text
+            ):
+                hint = (
+                    f"Public profile @{username} not found on TikTok. "
+                    "Check the username is correct (not only seller UID). "
+                )
+                if account_id is not None:
+                    hint += "If cookies are old, paste fresh cookies and sync again."
+                return _fail(username, hint.strip(), "not_found")
 
             if self._is_private(body_text):
                 display = await self._text(page, "[data-e2e='user-title'], h1, .share-title")
@@ -240,20 +339,23 @@ class ProfileScanner:
 
             try:
                 await page.wait_for_selector(
-                    "[data-e2e='user-follower-count'], .count-infos, h2[data-e2e='user-follower-count']",
-                    timeout=8000,
+                    "[data-e2e='user-follower-count'], .count-infos, "
+                    "h2[data-e2e='user-follower-count'], strong[data-e2e='followers-count']",
+                    timeout=12000,
                 )
             except PlaywrightTimeout:
                 pass
 
             parsed = await self._extract_from_dom(page)
-            if not parsed.get("followers") and not parsed.get("following"):
+            parsed = await self._extract_from_embedded_json(page, parsed)
+            parsed = await self._extract_from_body_counters(body_text, parsed)
+            if not parsed.get("stats_extracted"):
                 parsed = await self._extract_fallback(page, username, parsed)
 
-            if not parsed.get("followers") and not parsed.get("following") and not parsed.get("likes"):
+            if not _profile_stats_readable(parsed, body_text):
                 return _fail(
                     username,
-                    "Profile not accessible — stats not found on page.",
+                    "Could not read follower stats (TikTok layout/proxy). Account may still be fine — try another proxy or refresh cookies.",
                     "not_found",
                 )
 
@@ -324,8 +426,9 @@ class ProfileScanner:
         }
         for key, sel in e2e_map.items():
             txt = await self._text(page, sel)
-            if txt:
+            if txt is not None and str(txt).strip() != "":
                 data[key] = parse_count_text(txt)
+                data["stats_extracted"] = True
 
         # Legacy .count-infos layout
         try:
@@ -347,6 +450,80 @@ class ProfileScanner:
         if posts_txt:
             data["total_posts"] = parse_count_text(posts_txt)
 
+        return data
+
+    async def _extract_from_embedded_json(
+        self, page, partial: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Parse SIGI_STATE / universal data JSON blobs in page HTML."""
+        data = dict(partial)
+        try:
+            for script_id in (
+                "__UNIVERSAL_DATA_FOR_REHYDRATION__",
+                "SIGI_STATE",
+            ):
+                el = await page.query_selector(f"script#{script_id}")
+                if not el:
+                    continue
+                raw = await el.inner_text()
+                if not raw:
+                    continue
+                blob = json.loads(raw)
+                stats = self._stats_from_json_blob(blob)
+                if stats:
+                    data["_json_stats"] = True
+                    data["stats_extracted"] = True
+                for k, v in stats.items():
+                    if k not in data or not data.get(k):
+                        data[k] = v
+                if stats:
+                    break
+        except Exception as e:
+            logger.debug(f"embedded JSON extract: {e}")
+        return data
+
+    @staticmethod
+    def _stats_from_json_blob(obj: Any) -> Dict[str, int]:
+        """Walk JSON for followerCount / followingCount / heart / video fields."""
+        found: Dict[str, int] = {}
+
+        def walk(node):
+            if isinstance(node, dict):
+                if "followerCount" in node and isinstance(node["followerCount"], (int, float)):
+                    found["followers"] = int(node["followerCount"])
+                if "followingCount" in node and isinstance(node["followingCount"], (int, float)):
+                    found["following"] = int(node["followingCount"])
+                if "heart" in node and isinstance(node["heart"], (int, float)):
+                    found["likes"] = int(node["heart"])
+                if "heartCount" in node and isinstance(node["heartCount"], (int, float)):
+                    found["likes"] = int(node["heartCount"])
+                if "videoCount" in node and isinstance(node["videoCount"], (int, float)):
+                    found["total_posts"] = int(node["videoCount"])
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(obj)
+        return found
+
+    @staticmethod
+    async def _extract_from_body_counters(body_text: str, partial: Dict[str, Any]) -> Dict[str, Any]:
+        """Parse '0 Following 0 Followers 0 Likes' from visible page text."""
+        data = dict(partial)
+        if not body_text:
+            return data
+        patterns = {
+            "following": r"([\d.,]+[KMB]?)\s*Following",
+            "followers": r"([\d.,]+[KMB]?)\s*Followers",
+            "likes": r"([\d.,]+[KMB]?)\s*Likes",
+        }
+        for key, pat in patterns.items():
+            m = re.search(pat, body_text, re.I)
+            if m:
+                data[key] = parse_count_text(m.group(1))
+                data["stats_extracted"] = True
         return data
 
     async def _extract_fallback(

@@ -89,14 +89,16 @@ class BrowserManager:
                 logger.info("Camoufox browser launched")
             return
 
-        # Check if browser is still alive
+        # Check if browser is still alive (contexts is sync property — do not await)
         if self._browser is not None:
             try:
-                # Quick health check - try to access browser contexts
-                _ = await self._browser.contexts
-                return  # Browser is alive
+                if self._browser.is_connected():
+                    return
             except Exception as e:
                 logger.warning(f"Browser connection lost ({e}), reconnecting...")
+                await self._close_browser_safe()
+            else:
+                logger.warning("Browser disconnected, reconnecting...")
                 await self._close_browser_safe()
 
         if self._playwright is None:
@@ -142,14 +144,15 @@ class BrowserManager:
                 try:
                     await asyncio.sleep(interval_seconds)
                     if self._browser is not None:
-                        # Check browser connectivity
                         try:
-                            _ = await self._browser.contexts
+                            alive = self._browser.is_connected()
                         except Exception:
+                            alive = False
+                        if not alive:
                             logger.warning("Browser heartbeat failed, browser needs reconnect")
-                            # Clear stale contexts
                             self._contexts.clear()
                             self._pages.clear()
+                            await self._close_browser_safe()
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -267,15 +270,15 @@ class BrowserManager:
                 context = await self._browser.new_context(**context_options)
 
             context.set_default_timeout(self.navigation_timeout)
-            self.apply_stealth(context)
+            await self.apply_stealth(context)
             self._contexts[account_id] = context
             logger.info(f"Browser context created for account {account_id}")
             return context
 
-    def apply_stealth(self, context: "BrowserContext") -> None:
+    async def apply_stealth(self, context: "BrowserContext") -> None:
         """Anti-detection init scripts (tiktok-uploader browsers.py pattern)."""
         try:
-            context.add_init_script(STEALTH_INIT_SCRIPT)
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
         except Exception as e:
             logger.debug(f"apply_stealth failed: {e}")
 

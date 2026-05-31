@@ -151,10 +151,6 @@
             <span class="header-sync">Updated <span id="lastSync">—</span></span>
           </div>
           <div class="header-actions">
-            <button class="btn btn-ghost" type="button" id="btnProxyCheck" title="Check all proxies">
-              <i data-lucide="wifi"></i>
-              <span class="btn-label">Check proxies</span>
-            </button>
             <button class="btn btn-ghost" type="button" id="btnReschedule" title="Reschedule jobs">
               <i data-lucide="calendar-clock"></i>
               <span class="btn-label">Reschedule</span>
@@ -270,6 +266,12 @@
             <a class="btn btn-sm" href="/api/templates/proxies.csv" download>
               <i data-lucide="download"></i> Template
             </a>
+            <button class="btn btn-sm" type="button" id="btnProxyCheck" title="Check all proxies">
+              <i data-lucide="wifi"></i> Check all
+            </button>
+            <button class="btn btn-sm" type="button" id="btnProxySync" title="Sync from proxies.csv">
+              <i data-lucide="refresh-cw"></i> Sync CSV
+            </button>
           </div>
         </div>
         <div class="table-wrap" id="proxiesTable">
@@ -559,7 +561,7 @@
 
   <!-- Post composer modal -->
   <div class="modal-backdrop" id="modalPostComposer" role="dialog" aria-modal="true">
-    <div class="modal modal-lg">
+    <div class="modal modal-full post-composer-modal">
       <div class="modal-header">
         <h3 id="postComposerTitle">Compose post</h3>
         <button type="button" class="modal-close" data-close="modalPostComposer" aria-label="Close">
@@ -572,13 +574,19 @@
           <div class="form-row">
             <label>Post type</label>
             <div class="post-type-toggle">
-              <label><input type="radio" name="postType" value="slideshow" checked> Slideshow (auto)</label>
-              <label><input type="radio" name="postType" value="video"> Video (file path)</label>
+              <label><input type="radio" name="postType" value="slideshow" checked> Slideshow (images)</label>
+              <label><input type="radio" name="postType" value="video"> Video</label>
             </div>
           </div>
-          <div class="form-row" id="postVideoPathRow" hidden>
-            <label for="postVideoPath">Video path</label>
-            <input id="postVideoPath" type="text" placeholder="/path/to/video.mp4">
+          <div class="form-row" id="postSlideshowFilesRow">
+            <label for="postSlideshowFiles">Images</label>
+            <input id="postSlideshowFiles" type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple>
+            <p class="form-hint" id="postSlideshowHint">Choose images to upload, or click Generate for auto slideshow</p>
+          </div>
+          <div class="form-row" id="postVideoFileRow" hidden>
+            <label for="postVideoFile">Video file</label>
+            <input id="postVideoFile" type="file" accept="video/mp4,video/quicktime,video/webm,video/x-matroska">
+            <p class="form-hint" id="postVideoFileHint">MP4, MOV, WebM, or MKV</p>
           </div>
           <div class="form-row">
             <label for="postCaption">Caption</label>
@@ -610,6 +618,197 @@
         <button type="button" class="btn btn-primary" id="btnPostSubmit">
           <i data-lucide="upload"></i> Post
         </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Batch schedule modal -->
+  <div class="modal-backdrop" id="modalBatchSchedule" role="dialog" aria-modal="true">
+    <div class="modal modal-full batch-schedule-modal">
+      <div class="modal-header">
+        <h3 id="batchScheduleTitle">Batch schedule videos</h3>
+        <button type="button" class="modal-close" data-close="modalBatchSchedule" aria-label="Close">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <div class="modal-body batch-pipeline-body-wrap">
+        <input type="hidden" id="batchScheduleAccountId" value="">
+        <div class="batch-pipeline-layout">
+          <nav class="batch-pipeline-nav" aria-label="Batch schedule steps">
+            <button type="button" class="batch-pipeline-step active" data-batch-step="1">
+              <span class="batch-step-num">1</span>
+              <span class="batch-step-label">Source</span>
+              <span class="batch-step-desc">Videos</span>
+            </button>
+            <div class="batch-pipeline-connector" aria-hidden="true"></div>
+            <button type="button" class="batch-pipeline-step" data-batch-step="2">
+              <span class="batch-step-num">2</span>
+              <span class="batch-step-label">Schedule</span>
+              <span class="batch-step-desc">Time slots</span>
+            </button>
+            <div class="batch-pipeline-connector" aria-hidden="true"></div>
+            <button type="button" class="batch-pipeline-step" data-batch-step="3">
+              <span class="batch-step-num">3</span>
+              <span class="batch-step-label">Content</span>
+              <span class="batch-step-desc">Caption</span>
+            </button>
+            <div class="batch-pipeline-connector" aria-hidden="true"></div>
+            <button type="button" class="batch-pipeline-step" data-batch-step="4">
+              <span class="batch-step-num">4</span>
+              <span class="batch-step-label">Review</span>
+              <span class="batch-step-desc">Confirm</span>
+            </button>
+          </nav>
+
+          <div class="batch-pipeline-main">
+            <section class="batch-step-panel active" data-batch-panel="1">
+              <header class="batch-step-header">
+                <h4>Step 1 — Video source</h4>
+                <p class="form-hint">Choose where videos come from. Server path skips upload if app runs on the same machine.</p>
+              </header>
+              <div class="batch-step-card">
+                <label class="batch-field-label">Source type</label>
+                <div class="post-type-toggle">
+                  <label><input type="radio" name="batchSource" value="folder" checked> Browse folder</label>
+                  <label><input type="radio" name="batchSource" value="upload"> Browse files</label>
+                </div>
+              </div>
+              <div class="batch-step-card" id="batchFolderRow">
+                <label class="batch-field-label">Video folder</label>
+                <div class="file-browse-field">
+                  <input type="file" id="batchFolderPicker" class="file-browse-input-hidden" webkitdirectory directory multiple accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv">
+                  <button type="button" class="btn" id="btnBatchBrowseFolder">
+                    <i data-lucide="folder-open"></i> Choose folder…
+                  </button>
+                  <span class="file-browse-label" id="batchFolderLabel">No folder selected</span>
+                </div>
+                <details class="batch-server-path-details">
+                  <summary>Server path (optional)</summary>
+                  <input id="batchFolderPath" type="text" placeholder="/Volumes/SSD_1TB/movies">
+                </details>
+              </div>
+              <div class="batch-step-card" id="batchUploadRow" hidden>
+                <label class="batch-field-label" for="batchVideoFiles">Video files</label>
+                <input id="batchVideoFiles" type="file" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv" multiple>
+                <p class="form-hint" id="batchFilesLabel">No files selected</p>
+              </div>
+              <div class="batch-step-preview-box" id="batchStep1Preview">
+                <p class="form-hint">Select a folder or files to continue.</p>
+              </div>
+            </section>
+
+            <section class="batch-step-panel" data-batch-panel="2" hidden>
+              <header class="batch-step-header">
+                <h4>Step 2 — Posting schedule</h4>
+                <p class="form-hint">How many videos per day and which time windows. Random minute inside each slot.</p>
+              </header>
+              <div class="batch-step-cards-grid">
+                <div class="batch-step-card">
+                  <label class="batch-field-label" for="batchPostsPerDay">Posts per day</label>
+                  <input id="batchPostsPerDay" type="number" min="1" max="10" value="3">
+                </div>
+                <div class="batch-step-card">
+                  <label class="batch-field-label" for="batchStartDate">Start date</label>
+                  <input id="batchStartDate" type="date">
+                </div>
+              </div>
+              <div class="batch-step-card">
+                <label class="batch-field-label" for="batchTimeSlots">Time slots (one per line)</label>
+                <textarea id="batchTimeSlots" rows="4" placeholder="08:00-11:00&#10;14:00-17:00&#10;19:00-22:00"></textarea>
+                <p class="form-hint">Leave empty to use <code>config/settings.yaml</code> defaults.</p>
+              </div>
+              <div class="batch-step-preview-box" id="batchStep2Preview"></div>
+            </section>
+
+            <section class="batch-step-panel" data-batch-panel="3" hidden>
+              <header class="batch-step-header">
+                <h4>Step 3 — Post content</h4>
+                <p class="form-hint">Caption and hashtags applied to every video in the batch.</p>
+              </header>
+              <div class="batch-step-card">
+                <label class="batch-field-label" for="batchCaptionTemplate">Caption template</label>
+                <input id="batchCaptionTemplate" type="text" value="Video {n}" placeholder="Video {n} — {name}">
+                <p class="form-hint"><code>{n}</code> index · <code>{name}</code> filename · <code>{file}</code> full name</p>
+              </div>
+              <div class="batch-step-cards-grid">
+                <div class="batch-step-card">
+                  <label class="batch-field-label" for="batchHashtags">Hashtags</label>
+                  <input id="batchHashtags" type="text" value="fyp foryou viral">
+                </div>
+                <div class="batch-step-card">
+                  <label class="batch-field-label" for="batchAffiliateLink">Affiliate link</label>
+                  <input id="batchAffiliateLink" type="url" placeholder="https://...">
+                </div>
+              </div>
+            </section>
+
+            <section class="batch-step-panel" data-batch-panel="4" hidden>
+              <header class="batch-step-header">
+                <h4>Step 4 — Review &amp; schedule</h4>
+                <p class="form-hint">Confirm the pipeline, then schedule. App must stay running for auto-publish.</p>
+              </header>
+              <div class="batch-review-summary" id="batchReviewSummary"></div>
+              <div class="batch-step-preview-box batch-review-files" id="batchReviewFiles"></div>
+            </section>
+          </div>
+
+          <aside class="batch-pipeline-aside">
+            <div class="batch-aside-head">
+              <strong>Queue</strong>
+              <button type="button" class="btn btn-sm" id="btnBatchQueueRefresh">Refresh</button>
+            </div>
+            <div class="batch-queue-preview" id="batchQueuePreview">
+              <p class="form-hint">Pending scheduled posts for this account.</p>
+            </div>
+          </aside>
+        </div>
+      </div>
+      <div class="modal-footer batch-pipeline-footer">
+        <button type="button" class="btn" data-close="modalBatchSchedule">Cancel</button>
+        <div class="batch-footer-nav">
+          <button type="button" class="btn" id="btnBatchBack" hidden>
+            <i data-lucide="chevron-left"></i> Back
+          </button>
+          <button type="button" class="btn btn-primary" id="btnBatchNext">
+            Next <i data-lucide="chevron-right"></i>
+          </button>
+          <button type="button" class="btn btn-primary" id="btnBatchScheduleSubmit" hidden>
+            <i data-lucide="calendar"></i> Schedule batch
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Account logs modal -->
+  <div class="modal-backdrop" id="modalAccountLogs" role="dialog" aria-modal="true">
+    <div class="modal modal-full logs-modal">
+      <div class="modal-header">
+        <h3 id="accountLogsTitle">Account logs</h3>
+        <button type="button" class="modal-close" data-close="modalAccountLogs" aria-label="Close">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="log-filters" id="logFilters">
+          <button type="button" class="btn btn-sm log-filter active" data-log-filter="">All</button>
+          <button type="button" class="btn btn-sm log-filter" data-log-filter="farm">Farm</button>
+          <button type="button" class="btn btn-sm log-filter" data-log-filter="health">Health</button>
+          <button type="button" class="btn btn-sm log-filter" data-log-filter="sync">Sync</button>
+          <button type="button" class="btn btn-sm log-filter" data-log-filter="post">Post</button>
+          <button type="button" class="btn btn-sm log-filter" data-log-filter="error">Error</button>
+        </div>
+        <div class="account-logs-body" id="accountLogsBody">
+          <div class="empty-state">Loading logs…</div>
+        </div>
+        <div class="log-panel-foot" id="accountLogsFoot">—</div>
+      </div>
+      <div class="modal-footer">
+        <label class="form-check">
+          <input type="checkbox" id="logAutoRefresh" checked> Live updates
+        </label>
+        <button type="button" class="btn btn-sm" id="btnClearAccountLogs">Clear</button>
+        <button type="button" class="btn" data-close="modalAccountLogs">Close</button>
       </div>
     </div>
   </div>

@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS proxies (
 CREATE TABLE IF NOT EXISTS accounts (
     id SERIAL PRIMARY KEY,
     username TEXT UNIQUE NOT NULL,
+    display_name TEXT DEFAULT '',
     proxy_id INTEGER REFERENCES proxies(id),
     status TEXT DEFAULT 'pending',
     followers INTEGER DEFAULT 0,

@@ -25,10 +25,14 @@ class HealthMonitor:
         browser_manager,
         telegram_alert=None,
         settings: dict = None,
+        log_manager=None,
+        proxy_manager=None,
     ):
         self.account_mgr = account_manager
         self.browser = browser_manager
         self.telegram = telegram_alert
+        self.log_mgr = log_manager
+        self.proxy_mgr = proxy_manager
         self.settings = settings or {}
 
         health_config = settings.get("health_check", {}) if settings else {}
@@ -316,6 +320,54 @@ class HealthMonitor:
 
         return result
 
+    async def _resolve_proxy_url(self, account) -> Optional[str]:
+        """Use shared ProxyManager + DB ids so account.proxy_id matches a live endpoint."""
+        if not account.proxy_id or not self.proxy_mgr:
+            return None
+        try:
+            db = getattr(self.account_mgr, "db", None)
+            if db:
+                self.proxy_mgr.apply_db_ids_from_db(db)
+            proxy = self.proxy_mgr.get_proxy_by_db_id(account.proxy_id)
+            if not proxy:
+                logger.warning(
+                    f"No proxy row for account {account.id} (proxy_id={account.proxy_id})"
+                )
+                return None
+            if not proxy.is_alive:
+                await self.proxy_mgr.check_proxy(proxy)
+            if proxy.is_alive:
+                return proxy.url
+            logger.warning(
+                f"Proxy {proxy.ip}:{proxy.port} not live for account {account.id}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to get proxy for account {account.id}: {e}")
+        return None
+
+    @staticmethod
+    def summarize_check_result(result: dict) -> str:
+        """Human-readable summary for API / dashboard toast."""
+        if result.get("error"):
+            return str(result["error"])
+        login = result.get("login") or {}
+        if login.get("logged_in"):
+            parts = ["Login OK"]
+            if result.get("shadowban", {}).get("is_shadowbanned"):
+                parts.append("possible shadowban")
+            if result.get("rate_limit", {}).get("is_rate_limited"):
+                parts.append("rate limited")
+            return " · ".join(parts)
+        err = login.get("error") or "Not logged in"
+        if result.get("banned", {}).get("is_banned"):
+            return result["banned"].get("message") or "Account banned"
+        if err == "Not logged in":
+            return (
+                "Login failed — TikTok session invalid or expired. "
+                "Update cookies (sessionid) for this account."
+            )
+        return f"Login failed — {err}"
+
     async def check_account(self, account_id: int) -> Dict:
         """Run all health checks on a single account."""
         logger.info(f"Running full health check on account {account_id}")
@@ -324,18 +376,7 @@ class HealthMonitor:
         if not account:
             return {"account_id": account_id, "error": "Account not found"}
 
-        # Get proxy
-        proxy_url = None
-        if account.proxy_id:
-            try:
-                from src.proxy_manager import ProxyManager
-                pm = ProxyManager.from_settings(self.settings)
-                pm.load_from_csv()
-                proxy_obj = pm.get_proxy(account.proxy_id)
-                if proxy_obj and proxy_obj.is_alive:
-                    proxy_url = proxy_obj.url
-            except Exception as e:
-                logger.warning(f"Failed to get proxy for account {account_id}: {e}")
+        proxy_url = await self._resolve_proxy_url(account)
 
         results = {
             "account_id": account_id,
@@ -406,6 +447,15 @@ class HealthMonitor:
             )
 
         results["alerted"] = needs_alert
+        if login_result.get("logged_in"):
+            self._log_health(account_id, "Health check: login OK", "SUCCESS", results)
+        else:
+            self._log_health(
+                account_id,
+                "Health check: NOT LOGGED IN",
+                "WARNING",
+                results,
+            )
         return results
 
     async def check_all_accounts(self) -> Dict:
@@ -464,11 +514,25 @@ class HealthMonitor:
             return 0
 
     @classmethod
-    def from_settings(cls, settings: dict, account_manager, browser_manager, telegram_alert=None) -> "HealthMonitor":
+    def from_settings(
+        cls,
+        settings: dict,
+        account_manager,
+        browser_manager,
+        telegram_alert=None,
+        log_manager=None,
+        proxy_manager=None,
+    ) -> "HealthMonitor":
         """Create instance from settings dict."""
         return cls(
             account_manager=account_manager,
             browser_manager=browser_manager,
             telegram_alert=telegram_alert,
             settings=settings,
+            log_manager=log_manager,
+            proxy_manager=proxy_manager,
         )
+
+    def _log_health(self, account_id: int, message: str, level: str = "INFO", details: dict = None):
+        if self.log_mgr:
+            self.log_mgr.log(account_id, "health", level, message, details)
