@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl wget gnupg ca-certificates firefox-esr \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN pip install --upgrade pip
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Camoufox + Playwright
+RUN pip install camoufox playwright
+RUN playwright install firefox
+
+COPY . .
+
+ENV DATABASE_DRIVER=sqlite
+EXPOSE 8080
+CMD ["python", "src/main.py"]

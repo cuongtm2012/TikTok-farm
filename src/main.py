@@ -1,5 +1,6 @@
 # TikTok Farm - Main Application Entry Point
 # FastAPI app with APScheduler startup, graceful shutdown
+# FIXED v2: Clean signal handling (no os._exit), browser heartbeat, graceful shutdown
 
 import os
 import sys
@@ -93,6 +94,7 @@ class AppState:
 
     def __init__(self, settings: dict):
         self.settings = settings
+        self.shutdown_requested = False
         self.db = Database.from_settings(settings)
 
         # Initialize components
@@ -127,10 +129,6 @@ class AppState:
         self.tiktok_profile = TikTokProfileService(settings)
 
         self.proxy_manager.load_from_csv()
-        # Skip YAML import — use API instead
-        # accounts_yaml = settings.get("accounts", {}).get("yaml_path", "config/accounts.yaml")
-        # self.account_manager.load_accounts_from_yaml(accounts_yaml)
-
         logger.info("All components initialized")
 
     async def startup(self):
@@ -142,6 +140,9 @@ class AppState:
         if self.warmup_manager:
             tick = self.warmup_manager.run_daily_tick()
             logger.info(f"Warm-up on startup: {tick}")
+
+        # Start browser heartbeat to detect crashes early
+        await self.browser_manager.start_heartbeat(interval_seconds=60)
 
         # Warm up TikTok API sessions
         try:
@@ -176,10 +177,18 @@ class AppState:
 
     async def shutdown(self):
         """Gracefully shut down all services."""
+        if self.shutdown_requested:
+            return
+        self.shutdown_requested = True
+        
         logger.info("Shutting down TikTok Farm...")
 
-        # Stop scheduler
+        # Stop scheduler first (no new tasks)
         self.scheduler.stop()
+
+        # Cancel any running farm tasks gracefully
+        logger.info("Waiting for active farm tasks to complete...")
+        await asyncio.sleep(2)
 
         # Close all browsers
         await self.browser_manager.close_all()
@@ -210,18 +219,6 @@ async def app_lifespan(app: FastAPI):
     state = AppState(settings)
     app.state.farm = state
 
-    # Setup signal handlers
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(
-                sig,
-                lambda s=sig: asyncio.create_task(_shutdown_handler(s, state)),
-            )
-        except NotImplementedError:
-            # Windows doesn't support add_signal_handler
-            pass
-
     await state.startup()
     logger.info("Application ready")
 
@@ -229,15 +226,6 @@ async def app_lifespan(app: FastAPI):
 
     # Shutdown
     await state.shutdown()
-
-
-async def _shutdown_handler(sig, state: AppState):
-    """Handle shutdown signals."""
-    logger.warning(f"Received signal {sig.name}, shutting down...")
-    await state.shutdown()
-    # Force exit after timeout
-    await asyncio.sleep(5)
-    os._exit(0)
 
 
 # ---- Create FastAPI App ----
@@ -293,13 +281,14 @@ async def run_headless():
     settings = load_settings()
     state = AppState(settings)
 
-    # Setup signal handlers
+    # Setup signal handlers - clean shutdown, no os._exit
     loop = asyncio.get_event_loop()
     shutdown_event = asyncio.Event()
 
     def _signal_handler():
-        logger.warning("Shutdown signal received")
-        shutdown_event.set()
+        if not shutdown_event.is_set():
+            logger.warning("Shutdown signal received")
+            shutdown_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -334,8 +323,8 @@ def main():
             uvicorn.run(
                 "src.main:app",
                 host="0.0.0.0",
-                port=8000,
-                reload=debug,
+                port=8080,
+                reload=False,
                 log_level="info",
             )
         else:

@@ -1,7 +1,9 @@
 # TikTok Farm - Browser Manager Module
 # Singleton factory: Camoufox (preferred) or Playwright Chromium fallback
+# FIXED v2: Auto-reconnect browser on crash + health heartbeat
 
 import json
+import os
 import logging
 import asyncio
 from pathlib import Path
@@ -25,7 +27,10 @@ except ImportError:
 
 
 class BrowserManager:
-    """Singleton factory managing browser instances per account (Camoufox or Chromium)."""
+    """Singleton factory managing browser instances per account (Camoufox or Chromium).
+    
+    FIXED v2: Auto-reconnect on crash + periodic health heartbeat.
+    """
 
     _instance: Optional["BrowserManager"] = None
 
@@ -39,7 +44,7 @@ class BrowserManager:
         profile_dir: str = "profiles/",
         headless: bool = True,
         navigation_timeout: int = 30000,
-        use_camoufox: bool = False,
+        use_camoufox: bool = True,
     ):
         if hasattr(self, "_initialized") and self._initialized:
             return
@@ -55,36 +60,106 @@ class BrowserManager:
         self._pages: Dict[int, Any] = {}
         self._lock = asyncio.Lock()
         self._initialized = True
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._shutdown = False
+        self._browser_launched = False
         engine = "Camoufox" if self.use_camoufox else "Chromium"
         logger.info(f"BrowserManager initialized ({engine}, headless={headless})")
 
     async def _ensure_playwright(self):
+        """Launch or reconnect browser if crashed."""
         if not PLAYWRIGHT_AVAILABLE:
             raise RuntimeError(
                 "Playwright not installed. Run: pip install playwright && playwright install chromium"
             )
 
         if self.use_camoufox and CAMOUFOX_AVAILABLE:
-            if self._camoufox is None:
+            if self._camoufox is None or not self._browser_launched:
+                await self._close_browser_safe()
                 self._camoufox = AsyncCamoufox(headless=self.headless)
                 self._browser = await self._camoufox.__aenter__()
+                self._browser_launched = True
                 logger.info("Camoufox browser launched")
             return
+
+        # Check if browser is still alive
+        if self._browser is not None:
+            try:
+                # Quick health check - try to access browser contexts
+                _ = await self._browser.contexts
+                return  # Browser is alive
+            except Exception as e:
+                logger.warning(f"Browser connection lost ({e}), reconnecting...")
+                await self._close_browser_safe()
 
         if self._playwright is None:
             self._playwright = await async_playwright().start()
 
-        if self._browser is None:
-            launch_options = {
-                "headless": self.headless,
-                "args": [
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            }
-            self._browser = await self._playwright.chromium.launch(**launch_options)
-            logger.info("Chromium browser launched (Camoufox disabled or unavailable)")
+        launch_options = {
+            "headless": self.headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        }
+        self._browser = await self._playwright.chromium.launch(**launch_options)
+        self._browser_launched = True
+        logger.info("Chromium browser launched (Camoufox disabled or unavailable)")
+
+    async def _close_browser_safe(self):
+        """Safely close browser with error tolerance."""
+        try:
+            if self.use_camoufox and self._camoufox:
+                await self._camoufox.__aexit__(None, None, None)
+            elif self._browser:
+                await self._browser.close()
+        except Exception as e:
+            logger.debug(f"Browser close (expected during reconnect): {e}")
+        self._browser = None
+        self._camoufox = None
+        self._browser_launched = False
+
+    async def start_heartbeat(self, interval_seconds: int = 60):
+        """Start periodic browser health check to detect crashes early."""
+        if self._heartbeat_task is not None:
+            return
+
+        async def _heartbeat_loop():
+            while not self._shutdown:
+                try:
+                    await asyncio.sleep(interval_seconds)
+                    if self._browser is not None:
+                        # Check browser connectivity
+                        try:
+                            _ = await self._browser.contexts
+                        except Exception:
+                            logger.warning("Browser heartbeat failed, browser needs reconnect")
+                            # Clear stale contexts
+                            self._contexts.clear()
+                            self._pages.clear()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.warning(f"Heartbeat error: {e}")
+
+        self._heartbeat_task = asyncio.create_task(_heartbeat_loop())
+        logger.info(f"Browser heartbeat started ({interval_seconds}s interval)")
+
+    async def stop_heartbeat(self):
+        """Stop the heartbeat loop."""
+        self._shutdown = True
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
 
     async def create_browser(
         self,
@@ -167,7 +242,14 @@ class BrowserManager:
                 except Exception as e:
                     logger.warning(f"Proxy config failed for account {account_id}: {e}")
 
-            context = await self._browser.new_context(**context_options)
+            try:
+                context = await self._browser.new_context(**context_options)
+            except Exception as e:
+                # Browser might have crashed between health check and context creation
+                logger.warning(f"Failed to create context (reconnecting browser): {e}")
+                await self._ensure_playwright()  # Force reconnect
+                context = await self._browser.new_context(**context_options)
+
             context.set_default_timeout(self.navigation_timeout)
             self._contexts[account_id] = context
             logger.info(f"Browser context created for account {account_id}")
@@ -216,7 +298,9 @@ class BrowserManager:
                 del self._contexts[account_id]
 
     async def close_all(self):
+        await self.stop_heartbeat()
         async with self._lock:
+            self._shutdown = True
             for acc_id in list(self._pages.keys()):
                 try:
                     await self._pages[acc_id].close()
@@ -231,16 +315,7 @@ class BrowserManager:
                     pass
             self._contexts.clear()
 
-            if self._browser:
-                try:
-                    if self.use_camoufox and self._camoufox:
-                        await self._camoufox.__aexit__(None, None, None)
-                    else:
-                        await self._browser.close()
-                except Exception as e:
-                    logger.warning(f"Error closing browser: {e}")
-                self._browser = None
-                self._camoufox = None
+            await self._close_browser_safe()
 
             if self._playwright:
                 try:

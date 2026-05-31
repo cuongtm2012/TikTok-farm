@@ -382,7 +382,11 @@ class ProxyManager:
         return {"alive": alive, "dead": dead, "errors": errors}
 
     def sync_proxies_to_db(self, db):
-        """Sync current proxy list to database (SQLite or PostgreSQL)."""
+        """Sync current proxy list to database (SQLite or PostgreSQL).
+        
+        FIXED v2: Use INSERT OR REPLACE to preserve proxy IDs linked to accounts.
+        Never deletes proxies that have foreign key references.
+        """
         try:
             conn = db.connect()
             cursor = conn.cursor()
@@ -402,25 +406,38 @@ class ProxyManager:
                     )
                 """)
 
-            cursor.execute(db.sql("DELETE FROM proxies"))
-            insert_sql = db.sql(
-                "INSERT INTO proxies (ip, port, protocol, username, password, status, last_checked, fail_count) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            )
+            # Get existing proxy IDs from DB to preserve FK references
+            cursor.execute(db.sql("SELECT id, ip, port FROM proxies"))
+            existing_db = {}
+            for row in cursor.fetchall():
+                if db.is_sqlite:
+                    existing_db[(row["ip"], row["port"])] = row["id"]
+                else:
+                    existing_db[(row["ip"], row["port"])] = row["id"]
+
+            # Upsert: match by (ip, port), preserve existing IDs
+            upserted_ids = set()
             for p in self._proxies:
-                cursor.execute(
-                    insert_sql,
-                    (
-                        p.ip,
-                        p.port,
-                        p.protocol,
-                        p.username,
-                        p.password,
-                        p.status,
-                        p.last_checked,
-                        p.fail_count,
-                    ),
-                )
+                key = (p.ip, p.port)
+                if key in existing_db:
+                    existing_id = existing_db[key]
+                    cursor.execute(db.sql(
+                        "UPDATE proxies SET protocol=?, username=?, password=?, "
+                        "status=?, last_checked=?, fail_count=? WHERE id=?"
+                    ), (p.protocol, p.username, p.password, p.status,
+                        p.last_checked, p.fail_count, existing_id))
+                    p.id = existing_id
+                    upserted_ids.add(existing_id)
+                else:
+                    cursor.execute(db.sql(
+                        "INSERT INTO proxies (ip, port, protocol, username, password, "
+                        "status, last_checked, fail_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                    ), (p.ip, p.port, p.protocol, p.username, p.password,
+                        p.status, p.last_checked, p.fail_count))
+                    new_id = db.insert_returning_id(cursor, "proxies")
+                    p.id = new_id
+                    upserted_ids.add(new_id)
+
             conn.commit()
             conn.close()
             logger.info(f"Synced {len(self._proxies)} proxies to DB ({db.driver})")

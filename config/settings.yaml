@@ -5,17 +5,12 @@ app:
   log_level: "INFO"
 
 database:
-  driver: postgresql
   path: "data/farm.db"
-  host: localhost
-  port: 5433
-  name: tiktok_farm
-  user: tiktok_farm
-  password: tiktok_farm_secret
+  driver: "sqlite"
 
 proxies:
   csv_path: "config/proxies.csv"
-  check_timeout: 5
+  check_timeout: 10
   max_fail_before_disable: 3
 
 scheduler:
@@ -27,52 +22,18 @@ scheduler:
     - ["14:00", "17:00"]
     - ["19:00", "22:00"]
 
-camoufox:
-  headless: true
-  profile_dir: "profiles/"
-  navigation_timeout: 30000
-  use_camoufox: false
-
-redis:
-  enabled: false
-  host: localhost
-  port: 6379
-  db: 0
-  password: ""
-
-warmup:
-  days: 7
-  auto_assign_proxy: true
-
-accounts:
-  yaml_path: "config/accounts.yaml"
-  real_account_ids: [1, 2, 3]
-  require_cookies_on_seller_import: true
-  status_with_cookies: warming
-
-tiktok_profile:
-  enabled: true
-  ms_token: ""
-  browser: chromium
-
 content:
   images_per_post: 5
   output_dir: "data/posts/"
-  default_affiliate_link: ""
 
-affiliate:
-  commission_min_pct: 10
-  trending_refresh_hours: 6
-  video_output_dir: "data/videos/"
-  trending_cache: "data/affiliate/trending.json"
-  max_duration_seconds: 60
-  real_account_post_schedule:
-    posts_per_day: 2
-    time_slots:
-      - ["19:00", "22:00"]
+camoufox:
+  headless: true
+  profile_dir: "profiles/"
+  navigation_timeout: 60000
+  use_camoufox: false
 
 health_check:
-  interval_minutes: 60
+  interval_minutes: 30
   alert_on_shadowban: true
   alert_on_rate_limit: true
 
