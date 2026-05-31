@@ -137,6 +137,7 @@ async function refreshAll() {
       refreshAccounts(),
       refreshProxies(),
       refreshAlerts(),
+      refreshAffiliate(),
       refreshSettings(),
     ]);
     updateLastSync();
@@ -809,6 +810,79 @@ function escapeHtml(str) {
   return d.innerHTML;
 }
 
+// ---- Affiliate v2.0 ----
+
+async function refreshAffiliate() {
+  const statusWrap = document.getElementById("affiliateStatusPanel");
+  const tableWrap = document.getElementById("affiliateProductsTable");
+  if (!statusWrap) return;
+
+  try {
+    const [st, trending] = await Promise.all([
+      API.get("/api/affiliate/status"),
+      API.get("/api/affiliate/trending"),
+    ]);
+    const s = st.status || {};
+    statusWrap.innerHTML = `
+      <div class="settings-card">
+        <h4>Pipeline tools</h4>
+        <div class="profile-stats">
+          <span>ffmpeg: ${s.ffmpeg ? "yes" : "no"}</span>
+          <span>yt-dlp: ${s.yt_dlp ? "yes" : "no"}</span>
+          <span>Min commission: ${s.commission_min_pct || 10}%</span>
+          <span>Cached SP: ${s.trending_count || 0}</span>
+        </div>
+        <p class="form-hint" style="margin-top:0.5rem">Real accounts (IDs in settings) use video pipeline; Farm accounts use slideshow.</p>
+      </div>`;
+
+    const products = trending.products || [];
+    const badge = document.getElementById("navBadgeAffiliate");
+    if (badge) badge.textContent = String(products.length);
+
+    if (!tableWrap) return;
+    if (!products.length) {
+      tableWrap.innerHTML = `<div class="empty-state">No products cached. Click <strong>Scan SP</strong>.</div>`;
+      return;
+    }
+
+    tableWrap.innerHTML = `
+      <table>
+        <thead>
+          <tr>
+            <th>SP</th><th>Name</th><th>Price</th><th>Commission</th><th>Link</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${products.map((p) => `
+            <tr>
+              <td class="cell-mono">${escapeHtml(p.sp_id || "—")}</td>
+              <td>${escapeHtml(p.name || "—")}</td>
+              <td class="cell-mono">${p.price ?? "—"}</td>
+              <td class="cell-mono">${p.commission_pct ?? 0}%</td>
+              <td>${p.affiliate_link ? `<a href="${escapeHtml(p.affiliate_link)}" target="_blank" rel="noopener">open</a>` : "—"}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>`;
+  } catch (e) {
+    statusWrap.innerHTML = `<div class="empty-state">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function scanAffiliateProducts() {
+  const btn = document.getElementById("btnAffiliateScan");
+  setButtonLoading(btn, true);
+  try {
+    toast("Scanning trending products…");
+    const r = await API.post("/api/affiliate/scan?limit=20");
+    toast(`Found ${r.count || 0} products`);
+    refreshAffiliate();
+  } catch (e) {
+    toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
+  }
+}
+
 // ---- Settings ----
 
 async function refreshSettings() {
@@ -962,7 +1036,7 @@ function initNav() {
     }
   });
 
-  const sections = ["overview", "accounts", "proxies", "alerts", "settings"];
+  const sections = ["overview", "accounts", "proxies", "alerts", "affiliate", "settings"];
   const observer = new IntersectionObserver(
     (entries) => {
       const visible = entries
@@ -1205,6 +1279,8 @@ function init() {
   document.getElementById("btnRefresh")?.addEventListener("click", refreshAll);
   document.getElementById("btnProxyCheck")?.addEventListener("click", checkAllProxies);
   document.getElementById("btnReschedule")?.addEventListener("click", rescheduleJobs);
+  document.getElementById("btnAffiliateScan")?.addEventListener("click", scanAffiliateProducts);
+  document.getElementById("btnAffiliateRefresh")?.addEventListener("click", refreshAffiliate);
 
   refreshAll();
   refreshTimer = setInterval(refreshAll, 60000);

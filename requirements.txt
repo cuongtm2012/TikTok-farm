@@ -9,8 +9,9 @@ aiohttp>=3.9.0
 # Browser automation
 playwright>=1.40.0
 
-# Image processing
+# Image / video
 Pillow>=10.1.0
+yt-dlp>=2024.1.0
 
 # Database
 aiosqlite>=0.19.0
@@ -25,15 +26,12 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 tenacity>=8.2.0
 
-# Camoufox (anti-detect browser) — optional, enable in settings camoufox.use_camoufox
+# Camoufox (anti-detect browser) — optional
 # camoufox>=0.4.0
 
-# TikTok profile sync — public profile lookup
-TikTokApi>=6.3.0
+# TikTok public profile (optional)
+# https://github.com/davidteather/TikTok-Api
+TikTokApi>=7.3.0
 
 # Redis (APScheduler job store when redis.enabled=true)
 redis>=5.0.0
-
-# Optional: fetch public TikTok profile stats (dashboard sync / lookup)
-# https://github.com/davidteather/TikTok-Api
-TikTokApi>=7.3.0

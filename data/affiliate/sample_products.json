@@ -1,0 +1,28 @@
+{
+  "products": [
+    {
+      "sp_id": "demo001",
+      "name": "Tai nghe Bluetooth chong on",
+      "price": 299000,
+      "commission_pct": 15,
+      "commission_amount": 44850,
+      "sales_count": 1200,
+      "category": "Dien tu",
+      "video_urls": [],
+      "affiliate_link": "https://www.tiktok.com",
+      "image_url": ""
+    },
+    {
+      "sp_id": "demo002",
+      "name": "Son kem li cao cap",
+      "price": 89000,
+      "commission_pct": 20,
+      "commission_amount": 17800,
+      "sales_count": 3400,
+      "category": "My pham",
+      "video_urls": [],
+      "affiliate_link": "https://www.tiktok.com",
+      "image_url": ""
+    }
+  ]
+}

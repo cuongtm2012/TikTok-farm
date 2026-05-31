@@ -37,6 +37,7 @@ from src.scheduler import FarmScheduler
 from src.health_monitor import HealthMonitor
 from src.telegram_alert import TelegramAlert
 from src.tiktok_profile import TikTokProfileService
+from src.affiliate import AffiliatePipeline
 
 # Setup logging
 LOG_DIR = Path("logs")
@@ -109,6 +110,9 @@ class AppState:
         self.health_monitor = HealthMonitor.from_settings(
             settings, self.account_manager, self.browser_manager, self.telegram
         )
+        self.affiliate_pipeline = AffiliatePipeline(
+            settings, self.post_engine, self.account_manager
+        )
         self.scheduler = FarmScheduler.from_settings(
             settings,
             self.account_manager,
@@ -118,6 +122,7 @@ class AppState:
             proxy_manager=self.proxy_manager,
             session_service=self.session_service,
             warmup_manager=self.warmup_manager,
+            affiliate_pipeline=self.affiliate_pipeline,
         )
         self.tiktok_profile = TikTokProfileService(settings)
 
@@ -181,6 +186,9 @@ class AppState:
 
         # Close proxy manager
         await self.proxy_manager.close()
+
+        if self.affiliate_pipeline:
+            await self.affiliate_pipeline.close()
 
         # Close telegram
         await self.telegram.close()

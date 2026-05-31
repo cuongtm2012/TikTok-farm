@@ -349,6 +349,114 @@ class PostEngine:
 
         return result
 
+    async def upload_video(
+        self,
+        account_id: int,
+        video_path: str,
+        caption: str = "",
+        hashtags: str = "",
+        affiliate_link: str = "",
+        username: str = "",
+        password: str = "",
+        cookie_data: Optional[str] = None,
+        proxy_url: Optional[str] = None,
+    ) -> Dict:
+        """Upload a single mp4 video to TikTok."""
+        logger.info(f"[Account {account_id}] Starting video upload from {video_path}")
+
+        result = {
+            "success": False,
+            "post_id": None,
+            "error": None,
+            "posted_at": None,
+            "media_type": "video",
+        }
+
+        video_file = Path(video_path)
+        if not video_file.exists():
+            result["error"] = f"Video not found: {video_path}"
+            return result
+
+        try:
+            page = await self.browser.get_page(account_id, proxy_url)
+            logged_in = await self._ensure_login(
+                page, account_id, username, password, cookie_data
+            )
+            if not logged_in:
+                result["error"] = "Login failed"
+                return result
+
+            await self.browser.navigate_safe(page, self.UPLOAD_URL)
+            await asyncio.sleep(5)
+
+            file_input = await page.query_selector('input[type="file"]')
+            if not file_input:
+                upload_btn = await page.query_selector(
+                    'button:has-text("Select"), [data-e2e="upload-button"]'
+                )
+                if upload_btn:
+                    await upload_btn.click()
+                    await asyncio.sleep(2)
+                    file_input = await page.query_selector('input[type="file"]')
+
+            if not file_input:
+                result["error"] = "Could not find file upload input"
+                return result
+
+            await file_input.set_input_files(str(video_file.resolve()))
+            logger.info(f"[Account {account_id}] Video file selected")
+            await asyncio.sleep(8)
+
+            caption_input = await page.query_selector(
+                '[data-e2e="caption-input"], textarea, [contenteditable="true"]'
+            )
+            if caption_input:
+                full_caption = caption
+                if hashtags:
+                    tag_str = " ".join([f"#{t.strip()}" for t in hashtags.split()])
+                    full_caption = f"{caption}\n\n{tag_str}" if caption else tag_str
+                await caption_input.click()
+                await asyncio.sleep(0.5)
+                try:
+                    await caption_input.fill(full_caption)
+                except Exception:
+                    await caption_input.type(full_caption, delay=20)
+
+            if affiliate_link:
+                try:
+                    affiliate_input = await page.query_selector(
+                        'input[placeholder*="link"], [data-e2e="affiliate-input"]'
+                    )
+                    if affiliate_input:
+                        await affiliate_input.fill(affiliate_link)
+                except Exception as e:
+                    logger.warning(f"[Account {account_id}] Affiliate link: {e}")
+
+            await asyncio.sleep(2)
+            post_btn = await page.query_selector(
+                'button:has-text("Post"), [data-e2e="post-button"]'
+            )
+            if post_btn:
+                await post_btn.click()
+                await asyncio.sleep(12)
+                result["success"] = True
+                result["posted_at"] = datetime.now().isoformat()
+                result["tiktok_post_id"] = await self._extract_post_id(page)
+                await self._persist_session(account_id, page)
+            else:
+                result["error"] = "Could not find Post button"
+
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(f"[Account {account_id}] Video upload error: {e}", exc_info=True)
+        finally:
+            try:
+                await self.browser.close_context(account_id)
+            except Exception as e:
+                logger.warning(f"[Account {account_id}] Cleanup: {e}")
+
+        return result
+
     async def get_post_stats(self, account_id: int, post_url: str) -> Optional[Dict]:
         """Get stats for an existing post (views, likes, comments, shares)."""
         try:

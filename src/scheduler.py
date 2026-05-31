@@ -96,6 +96,16 @@ class FarmScheduler:
         content_cfg = settings.get("content", {})
         self.default_affiliate_link = content_cfg.get("default_affiliate_link", "")
 
+        accounts_cfg = settings.get("accounts", {})
+        self.real_account_ids = set(accounts_cfg.get("real_account_ids") or [])
+        aff_cfg = settings.get("affiliate", {})
+        real_sched = aff_cfg.get("real_account_post_schedule", {})
+        self.real_posts_per_day = int(real_sched.get("posts_per_day", 2))
+        self.real_post_time_slots = real_sched.get(
+            "time_slots", [["19:00", "22:00"]]
+        )
+        self.affiliate_pipeline = None  # set from main.py
+
     def start(self):
         """Start the APScheduler."""
         if not APSCHEDULER_AVAILABLE:
@@ -171,6 +181,9 @@ class FarmScheduler:
 
         logger.info(f"Scheduled daily jobs for {len(active_accounts)} accounts")
 
+    def is_real_account(self, account_id: int) -> bool:
+        return account_id in self.real_account_ids
+
     def schedule_account_daily(self, account_id: int):
         """Schedule farm sessions and posts for a specific account for today."""
         if not self._scheduler:
@@ -181,9 +194,14 @@ class FarmScheduler:
             logger.warning(f"Account {account_id} not found for scheduling")
             return
 
-        # Schedule farm sessions (2-3 random times throughout the day)
+        is_real = self.is_real_account(account_id)
+        farm_count = 1 if is_real else self.farm_sessions_per_day
+        posts_per_day = self.real_posts_per_day if is_real else self.posts_per_day
+        post_slots = self.real_post_time_slots if is_real else self.post_time_slots
+
+        # Schedule farm sessions (fewer for Real accounts — focus on video posts)
         farm_sessions = self._generate_random_times(
-            self.farm_sessions_per_day,
+            farm_count,
             hours_range=(6, 23),
         )
 
@@ -210,10 +228,12 @@ class FarmScheduler:
             )
             logger.info(f"Scheduled farm session for {account.username} at {run_time}")
 
-        # Schedule posts (3/day in defined time slots)
-        posts_per_slot = max(1, self.posts_per_day // len(self.post_time_slots))
+        # Schedule posts (Real: golden hours video; Farm: slideshow slots)
+        if not post_slots:
+            post_slots = self.post_time_slots
+        posts_per_slot = max(1, posts_per_day // len(post_slots))
 
-        for slot_idx, (start_str, end_str) in enumerate(self.post_time_slots):
+        for slot_idx, (start_str, end_str) in enumerate(post_slots):
             start_h, start_m = map(int, start_str.split(":"))
             end_h, end_m = map(int, end_str.split(":"))
 
@@ -417,6 +437,10 @@ class FarmScheduler:
 
             account = session["account"]
 
+            if self.is_real_account(account_id) and self.affiliate_pipeline:
+                await self._run_affiliate_video_post(account_id, session, job_id)
+                return
+
             # Get content pipeline
             from src.content_pipeline import ContentPipeline
             pipeline = ContentPipeline.from_settings(self.settings)
@@ -569,6 +593,44 @@ class FarmScheduler:
         self._running = False
 
     @classmethod
+    async def _run_affiliate_video_post(self, account_id: int, session: dict, job_id: str):
+        """Real account: affiliate pipeline video upload."""
+        try:
+            result = await self.affiliate_pipeline.run_for_account(
+                account_id, session
+            )
+            if result.get("success"):
+                product = result.get("steps", {}).get("product", "")
+                post_id = self.account_mgr.add_post(
+                    account_id=account_id,
+                    content_path=result.get("steps", {}).get("edited", ""),
+                    caption=product,
+                    hashtags="affiliate tiktokshop",
+                    affiliate_link=self.default_affiliate_link,
+                    scheduled_at=datetime.now().isoformat(),
+                )
+                upload = result.get("steps", {}).get("upload") or {}
+                if post_id and upload.get("tiktok_post_id"):
+                    self.account_mgr.mark_post_posted(
+                        post_id, tiktok_post_id=upload["tiktok_post_id"]
+                    )
+                acc = self.account_mgr.get_account(account_id)
+                self.account_mgr.update_account(
+                    account_id,
+                    total_posts=(acc.total_posts or 0) + 1,
+                    last_active=datetime.now().isoformat(),
+                )
+                if job_id in self._retry_counts:
+                    del self._retry_counts[job_id]
+                logger.info(f"Affiliate video post OK for account {account_id}")
+            else:
+                logger.error(f"Affiliate post failed: {result.get('error')}")
+                await self._handle_retry(job_id, account_id, "post")
+        except Exception as e:
+            logger.error(f"Affiliate post error: {e}", exc_info=True)
+            await self._handle_retry(job_id, account_id, "post")
+
+    @classmethod
     def from_settings(
         cls,
         settings: dict,
@@ -579,8 +641,9 @@ class FarmScheduler:
         proxy_manager=None,
         session_service=None,
         warmup_manager=None,
+        affiliate_pipeline=None,
     ) -> "FarmScheduler":
-        return cls(
+        inst = cls(
             account_manager=account_manager,
             farm_engine=farm_engine,
             post_engine=post_engine,
@@ -590,3 +653,5 @@ class FarmScheduler:
             session_service=session_service,
             warmup_manager=warmup_manager,
         )
+        inst.affiliate_pipeline = affiliate_pipeline
+        return inst

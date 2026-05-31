@@ -1,13 +1,12 @@
 app:
   name: "TikTok Farm"
-  version: "1.0.0"
+  version: "2.0.0"
   debug: false
   log_level: "INFO"
 
 database:
-  # driver: sqlite | postgresql
   driver: postgresql
-  path: "data/farm.db"   # used when driver=sqlite
+  path: "data/farm.db"
   host: localhost
   port: 5433
   name: tiktok_farm
@@ -32,7 +31,7 @@ camoufox:
   headless: true
   profile_dir: "profiles/"
   navigation_timeout: 30000
-  use_camoufox: false   # true when pip install camoufox
+  use_camoufox: false
 
 redis:
   enabled: false
@@ -47,17 +46,28 @@ warmup:
 
 accounts:
   yaml_path: "config/accounts.yaml"
+  real_account_ids: [1, 2, 3]
 
-# Public profile stats via https://github.com/davidteather/TikTok-Api
 tiktok_profile:
   enabled: true
-  ms_token: "8mLW9QGWCGpaA_TG6Rkw6iAYD9sY0vUvLOGtYIRs8eCLusG6Njlbu4vr5ZIP6GvvQTPR4zJjgVSceNwpwZvTlu7LIzJVqEMkzWKCtaMzVGAYmMUGQaPer848FAth9Xp_rCVBgdzuS1Semg=="
-  browser: chromium     # chromium | firefox | webkit
+  ms_token: ""
+  browser: chromium
 
 content:
   images_per_post: 5
   output_dir: "data/posts/"
   default_affiliate_link: ""
+
+affiliate:
+  commission_min_pct: 10
+  trending_refresh_hours: 6
+  video_output_dir: "data/videos/"
+  trending_cache: "data/affiliate/trending.json"
+  max_duration_seconds: 60
+  real_account_post_schedule:
+    posts_per_day: 2
+    time_slots:
+      - ["19:00", "22:00"]
 
 health_check:
   interval_minutes: 60

@@ -292,11 +292,11 @@ main.py
 | 11 | Warm-up 7 ngày orchestration | ✅ |
 | 12 | Posting thực tế | ❌ chưa test |
 | **MỚI** | | |
-| 13 | Scanner SP Trending | ❌ chưa làm |
-| 14 | Downloader video mẫu | ❌ chưa làm |
-| 15 | Video Editor (ffmpeg) | ❌ chưa làm |
-| 16 | Upload video + link affiliate | ❌ chưa làm |
-| 17 | Lịch post riêng Real vs Farm | ❌ chưa làm |
+| 13 | Scanner SP Trending | ✅ (Playwright + sample fallback) |
+| 14 | Downloader video mẫu | ✅ (yt-dlp + direct URL) |
+| 15 | Video Editor (ffmpeg) | ✅ |
+| 16 | Upload video + link affiliate | ✅ (PostEngine.upload_video) |
+| 17 | Lịch post riêng Real vs Farm | ✅ (`real_account_ids` + golden hours) |
 
 ---
 
@@ -315,13 +315,10 @@ main.py
 - Dashboard: Settings tab (ms_token config)
 - Loading spinners + toast indicators
 
-### 🔧 Đang xây dựng
-- PostEngine: upload video (mp4) thay vì slideshow ảnh
-- Affiliate Scanner: crawl TikTok Shop Marketplace
-- Video Downloader: yt-dlp integration
-- Video Editor: ffmpeg + Pillow
-- Uploader: post video + link affiliate
-- Scheduler: lịch riêng Real vs Farm
+### 🔧 Cần test production
+- Affiliate Scanner: crawl TikTok Shop (cần login / DOM thật)
+- Video download từ TikTok URL (cần yt-dlp + token)
+- Upload video mp4 trên TikTok (DOM upload 2026)
 
 ### ⚠️ Cần verify trên TikTok production
 - DOM selectors (login, upload, farm actions)

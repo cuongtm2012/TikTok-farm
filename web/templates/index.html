@@ -70,6 +70,19 @@
         </div>
 
         <div class="nav-group">
+          <span class="nav-label">Affiliate v2</span>
+          <ul class="nav-list">
+            <li>
+              <a href="#affiliate" class="nav-link" data-section="affiliate" data-title="Affiliate" data-subtitle="SP trending &amp; video pipeline">
+                <i data-lucide="shopping-bag"></i>
+                <span class="nav-link-text">Affiliate</span>
+                <span class="nav-badge" id="navBadgeAffiliate">0</span>
+              </a>
+            </li>
+          </ul>
+        </div>
+
+        <div class="nav-group">
           <span class="nav-label">Configuration</span>
           <ul class="nav-list">
             <li>
@@ -241,6 +254,31 @@
         </h2>
         <div class="panel" id="alertsList">
           <div class="empty-state">Loading alerts…</div>
+        </div>
+      </section>
+      </section>
+
+      <section class="page-section" id="affiliate">
+      <section class="section">
+        <div class="section-head">
+          <h2 class="section-title">
+            <i data-lucide="shopping-bag" style="width:20px;height:20px"></i>
+            Affiliate pipeline
+          </h2>
+          <div class="section-actions">
+            <button class="btn btn-sm" type="button" id="btnAffiliateScan">
+              <i data-lucide="radar"></i> Scan SP
+            </button>
+            <button class="btn btn-sm btn-primary" type="button" id="btnAffiliateRefresh">
+              <i data-lucide="refresh-cw"></i> Refresh
+            </button>
+          </div>
+        </div>
+        <div class="panel" id="affiliateStatusPanel">
+          <div class="empty-state">Loading affiliate status…</div>
+        </div>
+        <div class="table-wrap" id="affiliateProductsTable" style="margin-top:1rem">
+          <div class="empty-state">No products — click Scan SP</div>
         </div>
       </section>
       </section>

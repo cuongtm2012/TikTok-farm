@@ -3,6 +3,7 @@
 
 import logging
 import os
+from datetime import datetime
 from typing import Optional, List
 from pathlib import Path
 
@@ -701,6 +702,72 @@ async def resolve_alert(request: Request, alert_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---- Affiliate Pipeline v2.0 ----
+
+@router.get("/affiliate/status")
+async def affiliate_status(request: Request):
+    state = get_state(request)
+    return {"success": True, "status": state.affiliate_pipeline.status()}
+
+
+@router.post("/affiliate/scan")
+async def affiliate_scan(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    category: str = Query(""),
+):
+    state = get_state(request)
+    try:
+        products = await state.affiliate_pipeline.scan_and_cache(
+            limit=limit, category=category
+        )
+        return {"success": True, "count": len(products), "products": products}
+    except Exception as e:
+        logger.error(f"Affiliate scan failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/affiliate/trending")
+async def affiliate_trending(request: Request):
+    state = get_state(request)
+    products = state.affiliate_pipeline.load_cached_trending()
+    return {"success": True, "count": len(products), "products": products}
+
+
+@router.post("/affiliate/run/{account_id}")
+async def affiliate_run_account(request: Request, account_id: int):
+    """Run full affiliate pipeline for one account (Real accounts)."""
+    state = get_state(request)
+    account = state.account_manager.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    session = {"ok": True, "account": account}
+    if state.session_service:
+        try:
+            prep = await state.session_service.prepare(account_id)
+            if prep.get("ok"):
+                session = prep
+        except Exception as e:
+            logger.warning(f"Session prepare: {e}")
+
+    try:
+        result = await state.affiliate_pipeline.run_for_account(
+            account_id, session
+        )
+        if result.get("success"):
+            acc = state.account_manager.get_account(account_id)
+            state.account_manager.update_account(
+                account_id,
+                total_posts=(acc.total_posts or 0) + 1,
+                last_active=datetime.now().isoformat(),
+            )
+        return {"success": result.get("success", False), "result": result}
+    except Exception as e:
+        logger.error(f"Affiliate run failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ---- TikTok API Settings ----
 
 SETTINGS_FILE = Path(__file__).parent.parent / "config" / "settings.yaml"
@@ -743,7 +810,6 @@ async def set_tiktok_ms_token(request: Request, data: dict = Body(...)):
         # Reinitialize the profile service
         state = get_state(request)
         state.tiktok_profile.ms_token = ms_token
-        state.tiktok_profile._ready = True
 
         return {"success": True, "message": "ms_token saved successfully. Restart container for full effect."}
     except Exception as e:
