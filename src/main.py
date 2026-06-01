@@ -33,6 +33,7 @@ from src.warmup_manager import WarmupManager
 from src.browser_manager import BrowserManager
 from src.event_bus import FarmEventBus
 from src.farm_engine import FarmEngine
+from src.farm_queue import FarmQueue
 from src.content_pipeline import ContentPipeline
 from src.post_engine import PostEngine
 from src.scheduler import FarmScheduler
@@ -90,6 +91,28 @@ def load_settings(path: str = "config/settings.yaml") -> dict:
         sys.exit(1)
 
 
+def save_settings(settings: dict, path: str = "config/settings.yaml") -> None:
+    """Persist settings dict to YAML."""
+    settings_path = Path(path)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(settings_path, "w", encoding="utf-8") as f:
+        yaml.dump(
+            settings,
+            f,
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+    logger.info(f"Settings saved to {path}")
+
+
+def farm_session_minutes(settings: dict) -> int:
+    farm_cfg = settings.get("farm", {})
+    if farm_cfg.get("session_minutes") is not None:
+        return int(farm_cfg["session_minutes"])
+    return int(settings.get("scheduler", {}).get("farm_session_minutes", 15))
+
+
 # ---- Global State ----
 
 class AppState:
@@ -113,6 +136,11 @@ class AppState:
             event_bus=self.event_bus,
             log_manager=self.log_manager,
         )
+        farm_cfg = settings.get("farm", {})
+        max_concurrent = int(farm_cfg.get("max_concurrent", 3))
+        self.max_concurrent_farms = max(1, max_concurrent)
+        self.farm_semaphore = asyncio.Semaphore(self.max_concurrent_farms)
+        self.farm_queue = FarmQueue(self)
         self.active_farm_tasks: dict = {}
         self.active_post_tasks: dict = {}
         self.content_pipeline = ContentPipeline.from_settings(settings)
@@ -158,6 +186,53 @@ class AppState:
         self.proxy_manager.load_from_csv()
         logger.info("All components initialized")
 
+    def apply_farm_settings(
+        self,
+        *,
+        max_concurrent: Optional[int] = None,
+        session_minutes: Optional[int] = None,
+    ) -> dict:
+        """Update farm parallelism / session length at runtime and persist to YAML."""
+        farm_cfg = self.settings.setdefault("farm", {})
+        changed = False
+
+        if max_concurrent is not None:
+            v = max(1, min(10, int(max_concurrent)))
+            farm_cfg["max_concurrent"] = v
+            self.max_concurrent_farms = v
+            self.farm_semaphore = asyncio.Semaphore(v)
+            if self.scheduler:
+                self.scheduler.max_concurrent_farms = v
+            changed = True
+            logger.info(f"Farm max_concurrent set to {v}")
+
+        if session_minutes is not None:
+            v = max(5, min(120, int(session_minutes)))
+            farm_cfg["session_minutes"] = v
+            sch = self.settings.setdefault("scheduler", {})
+            sch["farm_session_minutes"] = v
+            if self.scheduler:
+                self.scheduler.farm_session_minutes = v
+            changed = True
+            logger.info(f"Farm session_minutes set to {v}")
+
+        if changed:
+            save_settings(self.settings)
+
+        return {
+            "max_concurrent": self.max_concurrent_farms,
+            "session_minutes": farm_session_minutes(self.settings),
+        }
+
+    def make_farm_engine(self) -> FarmEngine:
+        """New engine per manual farm task so multiple accounts can run in parallel."""
+        return FarmEngine(
+            self.browser_manager,
+            account_manager=self.account_manager,
+            event_bus=self.event_bus,
+            log_manager=self.log_manager,
+        )
+
     async def startup(self):
         """Start all services."""
         logger.info("Starting TikTok Farm services...")
@@ -186,6 +261,13 @@ class AppState:
         except Exception as e:
             logger.warning(f"Browser warmup failed (non-fatal): {e}")
 
+        self.scheduler.bind_farm_runtime(
+            active_farm_tasks=self.active_farm_tasks,
+            farm_semaphore=self.farm_semaphore,
+            make_farm_engine=self.make_farm_engine,
+            event_bus=self.event_bus,
+            max_concurrent_farms=self.max_concurrent_farms,
+        )
         self.scheduler.start()
 
         # Send startup notification
@@ -206,6 +288,9 @@ class AppState:
         self.shutdown_requested = True
         
         logger.info("Shutting down TikTok Farm...")
+
+        if getattr(self, "farm_queue", None):
+            await self.farm_queue.shutdown()
 
         # Stop scheduler first (no new tasks)
         self.scheduler.stop()

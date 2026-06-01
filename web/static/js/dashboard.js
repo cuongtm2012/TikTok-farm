@@ -33,6 +33,16 @@ const API = {
     if (!res.ok) throw new Error(await API._err(res, path));
     return res.json();
   },
+  async patch(path, data) {
+    const opts = { method: "PATCH" };
+    if (data !== undefined) {
+      opts.headers = { "Content-Type": "application/json" };
+      opts.body = JSON.stringify(data);
+    }
+    const res = await fetch(path, opts);
+    if (!res.ok) throw new Error(await API._err(res, path));
+    return res.json();
+  },
   async _err(res, path) {
     try {
       const j = await res.json();
@@ -60,12 +70,20 @@ let accountsCache = [];
 let proxiesCache = [];
 let accountPage = 1;
 let proxyPage = 1;
+const selectedAccountIds = new Set();
 const PAGE_SIZE = 25;
 let accountModalTab = "account-single";
 let proxyModalTab = "proxy-single";
 let postsCache = [];
 let liveWs = null;
 let liveSessionMeta = { type: "farm", accountId: null, duration: 15 };
+let farmQueuePollTimer = null;
+let farmQueuePollState = {
+  total: 0,
+  lastRunning: new Set(),
+  lastStats: { completed: 0, failed: 0 },
+  finishedIds: new Set(),
+};
 let accountLogsWs = null;
 let accountLogsAccountId = null;
 let accountLogsFilter = "";
@@ -157,7 +175,7 @@ function populateProxySelects() {
           `<option value="${p.id}">${escapeHtml(p.ip)}:${p.port} (#${p.id})</option>`
       )
       .join("");
-  ["sellerImportProxyId", "accSellerProxyId", "accProxyId"].forEach((id) => {
+  ["accSellerProxyId", "accProxyId"].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
     const prev = el.value;
@@ -166,6 +184,24 @@ function populateProxySelects() {
       if (prev) el.value = prev;
     }
   });
+  populateAccountFilterProxySelect();
+  populateAccountsBulkProxySelect();
+}
+
+function populateAccountsBulkProxySelect() {
+  const el = document.getElementById("accountsBulkProxy");
+  if (!el) return;
+  const prev = el.value;
+  const options =
+    '<option value="0">— None —</option>' +
+    proxiesCache
+      .map(
+        (p) =>
+          `<option value="${p.id}">${escapeHtml(p.ip)}:${p.port} (#${p.id})</option>`
+      )
+      .join("");
+  el.innerHTML = options;
+  if (prev) el.value = prev;
 }
 
 function cookieBadgeHtml(account) {
@@ -387,16 +423,399 @@ async function refreshCharts() {
   }
 }
 
+function getAccountFilters() {
+  const statusBtn = document.querySelector("#accountFilterStatus .filter-chip.active");
+  return {
+    status: statusBtn?.dataset.filterStatus ?? "",
+    cookies: document.getElementById("accountFilterCookies")?.value ?? "",
+    proxy: document.getElementById("accountFilterProxy")?.value ?? "",
+  };
+}
+
+function hasActiveAccountFilters() {
+  const q = (document.getElementById("accountSearch")?.value || "").trim();
+  const f = getAccountFilters();
+  return !!(q || f.status || f.cookies || f.proxy);
+}
+
+function accountMatchesCookieFilter(account, cookiesFilter) {
+  if (!cookiesFilter) return true;
+  const cs = account.cookie_status || {};
+  if (cookiesFilter === "none") return !cs.has_cookies;
+  if (cookiesFilter === "ok") {
+    return cs.has_cookies && cs.has_sessionid && !cs.expired;
+  }
+  if (cookiesFilter === "warn") {
+    return cs.has_cookies && (!cs.has_sessionid || cs.expired);
+  }
+  return true;
+}
+
+function accountMatchesProxyFilter(account, proxyFilter) {
+  if (!proxyFilter) return true;
+  const pid = account.proxy_id || 0;
+  if (proxyFilter === "none") return !pid;
+  if (proxyFilter === "assigned") return !!pid;
+  const want = parseInt(proxyFilter, 10);
+  return !Number.isNaN(want) && pid === want;
+}
+
 function filterAccounts(list) {
   const q = (document.getElementById("accountSearch")?.value || "").trim().toLowerCase();
-  if (!q) return list;
-  return list.filter(
-    (a) =>
+  const { status, cookies, proxy } = getAccountFilters();
+  return list.filter((a) => {
+    if (status && a.status !== status) return false;
+    if (!accountMatchesCookieFilter(a, cookies)) return false;
+    if (!accountMatchesProxyFilter(a, proxy)) return false;
+    if (!q) return true;
+    return (
       (a.username || "").toLowerCase().includes(q) ||
       (a.display_name || "").toLowerCase().includes(q) ||
       String(a.id).includes(q) ||
-      (a.status || "").toLowerCase().includes(q)
+      (a.status || "").toLowerCase().includes(q) ||
+      proxyLabel(a.proxy_id).toLowerCase().includes(q)
+    );
+  });
+}
+
+function updateAccountFiltersUi() {
+  const clearBtn = document.getElementById("btnClearAccountFilters");
+  if (clearBtn) clearBtn.hidden = !hasActiveAccountFilters();
+}
+
+function getActiveProxies() {
+  return proxiesCache.filter((p) => (p.status || "active") === "active");
+}
+
+function populateAccountFilterProxySelect() {
+  const el = document.getElementById("accountFilterProxy");
+  if (!el) return;
+  const prev = el.value;
+  const fixed = `
+    <option value="">All</option>
+    <option value="assigned">Has proxy</option>
+    <option value="none">No proxy</option>`;
+  const dynamic = getActiveProxies()
+    .map(
+      (p) =>
+        `<option value="${p.id}">#${p.id} ${escapeHtml(p.ip)}:${p.port}</option>`
+    )
+    .join("");
+  el.innerHTML = fixed + dynamic;
+  const valid = new Set(["", "assigned", "none", ...getActiveProxies().map((p) => String(p.id))]);
+  if (prev && valid.has(prev)) el.value = prev;
+  else if (prev && !valid.has(prev)) el.value = "";
+}
+
+function clearAccountFilters() {
+  document.getElementById("accountSearch").value = "";
+  document.querySelectorAll("#accountFilterStatus .filter-chip").forEach((b, i) => {
+    b.classList.toggle("active", i === 0);
+  });
+  const cookiesEl = document.getElementById("accountFilterCookies");
+  const proxyEl = document.getElementById("accountFilterProxy");
+  if (cookiesEl) cookiesEl.value = "";
+  if (proxyEl) proxyEl.value = "";
+  accountPage = 1;
+  updateAccountFiltersUi();
+  renderAccountsTable();
+}
+
+function getFilteredAccounts() {
+  return filterAccounts(accountsCache);
+}
+
+function getSelectedAccountIds() {
+  return [...selectedAccountIds];
+}
+
+function clearAccountSelection() {
+  selectedAccountIds.clear();
+  updateAccountsBulkBar();
+  renderAccountsTable();
+}
+
+function toggleAccountSelection(id, checked) {
+  if (checked) selectedAccountIds.add(id);
+  else selectedAccountIds.delete(id);
+  updateAccountsBulkBar();
+}
+
+function updateAccountsBulkBar() {
+  const bar = document.getElementById("accountsBulkBar");
+  const countEl = document.getElementById("accountsBulkCount");
+  const selectAllBtn = document.getElementById("btnSelectAllFiltered");
+  if (!bar || !countEl) return;
+  const n = selectedAccountIds.size;
+  bar.hidden = n === 0;
+  countEl.textContent = `${n} selected`;
+  const filtered = getFilteredAccounts();
+  if (selectAllBtn) {
+    const allSelected =
+      filtered.length > 0 && filtered.every((a) => selectedAccountIds.has(a.id));
+    selectAllBtn.hidden = filtered.length <= PAGE_SIZE;
+    selectAllBtn.textContent = allSelected
+      ? `Deselect all filtered (${filtered.length})`
+      : `Select all filtered (${filtered.length})`;
+  }
+}
+
+function buildProxyUsageCounts(skipAccountId = null) {
+  const usage = {};
+  for (const a of accountsCache) {
+    if (skipAccountId != null && a.id === skipAccountId) continue;
+    const pid = a.proxy_id || 0;
+    if (pid) usage[pid] = (usage[pid] || 0) + 1;
+  }
+  return usage;
+}
+
+function pickLeastLoadedProxyId(skipAccountId, reserved = {}) {
+  const alive = proxiesCache.filter((p) => p.status === "active");
+  if (!alive.length) return 0;
+  const usage = buildProxyUsageCounts(skipAccountId);
+  const load = (p) => (usage[p.id] || 0) + (reserved[p.id] || 0);
+  const empty = alive.filter((p) => load(p) === 0);
+  const pick = empty.length
+    ? empty.sort((a, b) => a.id - b.id)[0]
+    : alive.reduce((best, p) => (load(p) < load(best) ? p : best));
+  return pick.id;
+}
+
+async function runBulkOnAccounts(ids, label, worker, { delayMs = 400 } = {}) {
+  if (!ids.length) {
+    toast("Select at least one account", "error");
+    return { ok: 0, fail: 0 };
+  }
+  const toastEl = toast(`${label} (0/${ids.length})…`, "loading");
+  let ok = 0;
+  let fail = 0;
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    try {
+      await worker(id, i);
+      ok += 1;
+    } catch (e) {
+      fail += 1;
+      console.warn(`Bulk ${label} failed for #${id}:`, e);
+    }
+    if (toastEl) {
+      toastEl.textContent = `${label} (${i + 1}/${ids.length})…`;
+    }
+    if (delayMs && i < ids.length - 1) {
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  clearToast(toastEl);
+  return { ok, fail };
+}
+
+function toggleSelectAllFiltered() {
+  const filtered = getFilteredAccounts();
+  const allOn = filtered.every((a) => selectedAccountIds.has(a.id));
+  if (allOn) {
+    filtered.forEach((a) => selectedAccountIds.delete(a.id));
+  } else {
+    filtered.forEach((a) => selectedAccountIds.add(a.id));
+  }
+  updateAccountsBulkBar();
+  renderAccountsTable();
+}
+
+function toggleSelectPageAccounts(checked, pageIds) {
+  pageIds.forEach((id) => {
+    if (checked) selectedAccountIds.add(id);
+    else selectedAccountIds.delete(id);
+  });
+  updateAccountsBulkBar();
+  renderAccountsTable();
+}
+
+function syncBulkProxyPickVisibility() {
+  const action = document.getElementById("accountsBulkAction")?.value || "";
+  const proxySel = document.getElementById("accountsBulkProxy");
+  if (!proxySel) return;
+  proxySel.hidden = action !== "proxy:assign";
+}
+
+async function runSelectedBulkAction() {
+  const action = document.getElementById("accountsBulkAction")?.value || "";
+  if (!action) {
+    toast("Choose a bulk action first", "error");
+    return;
+  }
+  if (action.startsWith("status:")) {
+    await bulkApplyStatus(action.slice(7));
+  } else if (action === "proxy:assign") {
+    await bulkApplyProxy();
+  } else if (action === "proxy:auto") {
+    await bulkAutoAssignProxy();
+  } else if (action === "sync") {
+    await bulkSyncProfiles();
+  } else if (action === "check") {
+    await bulkCheckAccounts();
+  } else if (action === "farm") {
+    await bulkFarmAccounts();
+  } else if (action === "delete") {
+    await bulkDeleteAccounts();
+  }
+  const sel = document.getElementById("accountsBulkAction");
+  if (sel) sel.value = "";
+  syncBulkProxyPickVisibility();
+}
+
+async function bulkApplyStatus(statusOverride) {
+  const status =
+    statusOverride || document.getElementById("accountsBulkStatus")?.value;
+  if (!status) return;
+  const ids = getSelectedAccountIds();
+  const { ok, fail } = await runBulkOnAccounts(ids, "Set status", (id) =>
+    API.patch(`/api/accounts/${id}?status=${encodeURIComponent(status)}`)
   );
+  toast(`Status → ${status}: ${ok} ok${fail ? `, ${fail} failed` : ""}`);
+  await refreshAccounts();
+}
+
+async function bulkApplyProxy() {
+  const proxyId = parseInt(document.getElementById("accountsBulkProxy")?.value || "0", 10);
+  const ids = getSelectedAccountIds();
+  const { ok, fail } = await runBulkOnAccounts(ids, "Assign proxy", (id) =>
+    API.patch(`/api/accounts/${id}?proxy_id=${proxyId}`)
+  );
+  toast(`Proxy updated: ${ok} ok${fail ? `, ${fail} failed` : ""}`);
+  await refreshAccounts();
+}
+
+async function bulkAutoAssignProxy() {
+  const ids = getSelectedAccountIds();
+  const reserved = {};
+  const { ok, fail } = await runBulkOnAccounts(
+    ids,
+    "Auto-assign proxy",
+    async (id) => {
+      const pid = pickLeastLoadedProxyId(id, reserved);
+      if (!pid) throw new Error("No alive proxy");
+      await API.patch(`/api/accounts/${id}?proxy_id=${pid}`);
+      reserved[pid] = (reserved[pid] || 0) + 1;
+      const acc = accountsCache.find((a) => a.id === id);
+      if (acc) acc.proxy_id = pid;
+    },
+    { delayMs: 200 }
+  );
+  toast(`Auto proxy: ${ok} ok${fail ? `, ${fail} failed` : ""}`);
+  await refreshAll();
+}
+
+async function bulkSyncProfiles() {
+  const ids = getSelectedAccountIds();
+  const { ok, fail } = await runBulkOnAccounts(
+    ids,
+    "Sync profile",
+    (id) => API.post(`/api/actions/sync-profile/${id}`),
+    { delayMs: 1500 }
+  );
+  toast(`Sync: ${ok} ok${fail ? `, ${fail} failed` : ""}`);
+  await refreshAccounts();
+  refreshStats();
+}
+
+async function bulkCheckAccounts() {
+  const ids = getSelectedAccountIds();
+  const { ok, fail } = await runBulkOnAccounts(
+    ids,
+    "Health check",
+    (id) => API.post(`/api/actions/check/${id}`),
+    { delayMs: 800 }
+  );
+  toast(`Check: ${ok} ok${fail ? `, ${fail} failed` : ""}`);
+  await refreshAccounts();
+}
+
+async function bulkFarmAccounts() {
+  const ids = getSelectedAccountIds();
+  const names = ids
+    .map((id) => accountsCache.find((a) => a.id === id)?.username)
+    .filter(Boolean)
+    .slice(0, 6);
+  const maxC = 3;
+  const mins = 15;
+  const estHours = ((ids.length / maxC) * mins) / 60;
+  const ok = await confirmModal({
+    title: "Bulk farm (queue)",
+    message:
+      `Queue ${ids.length} account(s) for farm?\n\n` +
+      (names.length ? `@${names.join(", @")}${ids.length > 6 ? ", …" : ""}\n\n` : "") +
+      `Runs ${maxC} at a time · ~${mins} min each · est. ${estHours < 1 ? `${Math.round(estHours * 60)} min` : `${estHours.toFixed(1)} h`} total.`,
+    okText: "Queue farm",
+  });
+  if (!ok) return;
+  try {
+    const r = await API.postJson("/api/actions/farm/queue", { account_ids: ids });
+    showFarmQueueLiveLog(r.queue || {}, r.added ?? ids.length);
+    toast(r.message || "Farm queue started");
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+async function bulkDeleteAccounts() {
+  const ids = getSelectedAccountIds();
+  const ok = await confirmModal({
+    title: "Delete accounts",
+    message: `Delete ${ids.length} account(s) permanently?\n\nCookies, posts, logs, and alerts will be removed.`,
+    okText: "Delete",
+    danger: true,
+  });
+  if (!ok) return;
+  const { ok: done, fail } = await runBulkOnAccounts(
+    ids,
+    "Delete",
+    (id) => API.delete(`/api/accounts/${id}`),
+    { delayMs: 150 }
+  );
+  ids.forEach((id) => selectedAccountIds.delete(id));
+  toast(`Deleted: ${done}${fail ? `, ${fail} failed` : ""}`);
+  await refreshAll();
+}
+
+function initAccountsBulk() {
+  document.getElementById("btnSelectAllFiltered")?.addEventListener("click", toggleSelectAllFiltered);
+  document.getElementById("accountsBulkClear")?.addEventListener("click", clearAccountSelection);
+  document.getElementById("accountsBulkRun")?.addEventListener("click", runSelectedBulkAction);
+  document.getElementById("accountsBulkAction")?.addEventListener("change", syncBulkProxyPickVisibility);
+  syncBulkProxyPickVisibility();
+}
+
+function initAccountFilters() {
+  document.querySelectorAll("#accountFilterStatus .filter-chip").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#accountFilterStatus .filter-chip").forEach((b) => {
+        b.classList.toggle("active", b === btn);
+      });
+      accountPage = 1;
+      updateAccountFiltersUi();
+      renderAccountsTable();
+    });
+  });
+  ["accountFilterCookies", "accountFilterProxy"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("change", () => {
+      accountPage = 1;
+      updateAccountFiltersUi();
+      renderAccountsTable();
+    });
+  });
+  document.getElementById("btnClearAccountFilters")?.addEventListener("click", clearAccountFilters);
+
+  const sellerAutoProxy = document.getElementById("accSellerAutoProxy");
+  const sellerProxySel = document.getElementById("accSellerProxyId");
+  function syncSellerAutoProxyUi() {
+    if (!sellerProxySel || !sellerAutoProxy) return;
+    sellerProxySel.disabled = sellerAutoProxy.checked;
+    if (sellerAutoProxy.checked) sellerProxySel.value = "0";
+  }
+  sellerAutoProxy?.addEventListener("change", syncSellerAutoProxyUi);
+  syncSellerAutoProxyUi();
+  initAccountsBulk();
 }
 
 function filterProxies(list) {
@@ -436,15 +855,16 @@ function paginate(list, page) {
   return { slice: list.slice(start, start + PAGE_SIZE), page: p, pages, total };
 }
 
-function renderPagination(containerId, page, pages, total, onPage) {
+function renderPagination(containerId, page, pages, total, onPage, countLabel) {
   const el = document.getElementById(containerId);
   if (!el) return;
+  const countText = countLabel ?? `${total} item(s)`;
   if (total <= PAGE_SIZE) {
-    el.innerHTML = `<span>${total} item(s)</span><span></span>`;
+    el.innerHTML = `<span>${countText}</span><span></span>`;
     return;
   }
   el.innerHTML = `
-    <span>${total} item(s) · page ${page}/${pages}</span>
+    <span>${countText} · page ${page}/${pages}</span>
     <div class="pagination">
       <button class="btn btn-sm" type="button" data-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>Prev</button>
       <button class="btn btn-sm" type="button" data-page="${page + 1}" ${page >= pages ? "disabled" : ""}>Next</button>
@@ -466,6 +886,10 @@ async function refreshAccounts() {
   }
 
   accountsCache = data.accounts || [];
+  const validIds = new Set(accountsCache.map((a) => a.id));
+  for (const id of [...selectedAccountIds]) {
+    if (!validIds.has(id)) selectedAccountIds.delete(id);
+  }
   renderAccountsTable();
   const badge = document.getElementById("navBadgeAccounts");
   if (badge) badge.textContent = String(accountsCache.length);
@@ -488,15 +912,26 @@ function renderAccountsTable() {
   }
 
   if (!filtered.length) {
-    wrap.innerHTML = `<div class="empty-state">No accounts match your search</div>`;
+    wrap.innerHTML = `<div class="empty-state">No accounts match your filters</div>`;
+    updateAccountFiltersUi();
     return;
   }
+
+  updateAccountFiltersUi();
+  updateAccountsBulkBar();
+
+  const pageIds = slice.map((a) => a.id);
+  const allPageSelected =
+    pageIds.length > 0 && pageIds.every((id) => selectedAccountIds.has(id));
 
   wrap.innerHTML = `
     <div class="table-meta" id="accountsMeta"></div>
     <table>
       <thead>
         <tr>
+          <th class="col-check">
+            <input type="checkbox" id="accountSelectPage" title="Select page" ${allPageSelected ? "checked" : ""} aria-label="Select all on page">
+          </th>
           <th>Account</th>
           <th>Proxy</th>
           <th>Status</th>
@@ -515,8 +950,13 @@ function renderAccountsTable() {
             const secondary = dn
               ? `@${escapeHtml(a.username)} · ID ${a.id}`
               : `ID ${a.id}`;
+            const profileUrl = a.username ? `https://www.tiktok.com/@${encodeURIComponent(a.username)}` : "";
+            const checked = selectedAccountIds.has(a.id) ? "checked" : "";
             return `
-          <tr>
+          <tr class="${checked ? "row-selected" : ""}">
+            <td class="col-check">
+              <input type="checkbox" class="account-row-check" data-account-id="${a.id}" ${checked} aria-label="Select @${escapeHtml(a.username)}">
+            </td>
             <td>
               <div class="user-cell">
                 <div class="avatar">${initials(dn || a.username)}</div>
@@ -524,7 +964,10 @@ function renderAccountsTable() {
                   <button type="button" class="link-btn" data-view-account="${a.id}">
                     <strong>${escapeHtml(primary)}</strong>
                   </button>
-                  <div style="font-size:0.7rem;color:var(--text-dim)">${secondary}</div>
+                  <div style="font-size:0.7rem;color:var(--text-dim)">
+                    ${secondary}
+                    ${profileUrl ? ` · <a class="ext-link" href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener">Open TikTok</a>` : ""}
+                  </div>
                 </div>
               </div>
             </td>
@@ -557,10 +1000,13 @@ function renderAccountsTable() {
       </tbody>
     </table>`;
 
+  const countLabel = hasActiveAccountFilters()
+    ? `${total} of ${accountsCache.length} account(s)`
+    : `${total} item(s)`;
   renderPagination("accountsMeta", page, pages, total, (p) => {
     accountPage = p;
     renderAccountsTable();
-  });
+  }, countLabel);
 
   wrap.querySelectorAll("[data-action]").forEach((btn) => {
     btn.addEventListener("click", (e) => {
@@ -587,6 +1033,16 @@ function renderAccountsTable() {
   wrap.querySelectorAll("[data-view-account]").forEach((btn) => {
     btn.addEventListener("click", () => openAccountDetail(parseInt(btn.dataset.viewAccount, 10)));
   });
+  document.getElementById("accountSelectPage")?.addEventListener("change", (e) => {
+    toggleSelectPageAccounts(e.target.checked, pageIds);
+  });
+  wrap.querySelectorAll(".account-row-check").forEach((cb) => {
+    cb.addEventListener("change", (e) => {
+      toggleAccountSelection(parseInt(cb.dataset.accountId, 10), e.target.checked);
+      const row = cb.closest("tr");
+      if (row) row.classList.toggle("row-selected", e.target.checked);
+    });
+  });
   if (typeof lucide !== "undefined") lucide.createIcons();
 }
 
@@ -604,20 +1060,61 @@ async function openAccountDetail(accountId) {
       title.textContent = dn ? `${dn} (@${a.username})` : `@${a.username}`;
     }
     const cs = a.cookie_status || {};
+    const dn = (a.display_name || "").trim();
+    const nameLine = dn ? `${dn} (@${a.username})` : `@${a.username}`;
+    const proxyLine = a.proxy_id ? `Proxy #${a.proxy_id}` : "No proxy";
+    const cookieLine =
+      cookieBadgeHtml(a) +
+      (cs.has_sessionid ? " · sessionid present" : cs.has_cookies ? " · missing sessionid" : "");
     body.innerHTML = `
-      <div class="account-detail-grid">
-        <div class="account-detail-section">
-          <h4>Account</h4>
-          <p>ID ${a.id} · Proxy ${a.proxy_id || "—"} · <span class="badge ${BADGE_CLASS[a.status] || ""}">${a.status}</span></p>
-          <p style="font-size:0.8rem;color:var(--text-dim)">${escapeHtml(a.notes || "—")}</p>
+      <div class="account-detail-layout">
+        <div class="account-detail-hero">
+          <div class="account-detail-hero-main">
+            <div class="account-detail-name">${escapeHtml(nameLine)}</div>
+            <div class="account-detail-sub">
+              <span class="badge ${BADGE_CLASS[a.status] || "badge-pending"}">${escapeHtml(a.status)}</span>
+              <span class="account-detail-dot">·</span>
+              <span>${escapeHtml(proxyLine)}</span>
+              <span class="account-detail-dot">·</span>
+              <span>ID ${a.id}</span>
+            </div>
+          </div>
+          <div class="account-detail-hero-meta">
+            <div class="account-detail-meta-row">
+              <span class="meta-label">Cookies</span>
+              <span class="meta-value">${cookieLine}</span>
+            </div>
+            <div class="account-detail-meta-row">
+              <span class="meta-label">Notes</span>
+              <span class="meta-value">${escapeHtml(a.notes || "—")}</span>
+            </div>
+          </div>
         </div>
-        <div class="account-detail-section">
-          <h4>Cookies</h4>
-          <p>${cookieBadgeHtml(a)} ${cs.has_sessionid ? "· sessionid present" : cs.has_cookies ? "· missing sessionid" : ""}</p>
-          <textarea id="detailCookieInput" rows="4" placeholder="Paste cookie string: name=value; ..."></textarea>
-          <div class="actions" style="margin-top:0.5rem">
-            <button type="button" class="btn btn-sm btn-primary" id="btnDetailSaveCookies">Update cookies</button>
-            <button type="button" class="btn btn-sm" id="btnDetailDeleteCookies">Delete cookies</button>
+
+        <div class="account-detail-grid">
+          <div class="account-detail-card">
+            <div class="card-head">
+              <h4>Cookies</h4>
+              <div class="card-actions">
+                <button type="button" class="btn btn-sm btn-primary" id="btnDetailSaveCookies">Update cookies</button>
+                <button type="button" class="btn btn-sm btn-danger" id="btnDetailDeleteCookies">Delete cookies</button>
+              </div>
+            </div>
+            <p class="form-hint" style="margin-top:0">Paste cookie string (name=value; ...). Used by Check/Sync/Farm/Post.</p>
+            <textarea id="detailCookieInput" class="cookie-textarea" rows="10" placeholder="sessionid=xxx; msToken=yyy; ..."></textarea>
+          </div>
+
+          <div class="account-detail-card">
+            <div class="card-head">
+              <h4>Quick actions</h4>
+            </div>
+            <div class="account-detail-quick-grid">
+              <button type="button" class="btn btn-sm" data-action="check" data-id="${a.id}">Check login</button>
+              <button type="button" class="btn btn-sm" data-action="sync" data-id="${a.id}">Sync profile</button>
+              <button type="button" class="btn btn-sm" data-action="farm" data-id="${a.id}">Farm</button>
+              <button type="button" class="btn btn-sm" data-action="logs" data-id="${a.id}">Logs</button>
+            </div>
+            <p class="form-hint">These run on the account row using the same proxy + cookies.</p>
           </div>
         </div>
       </div>`;
@@ -637,7 +1134,13 @@ async function openAccountDetail(accountId) {
       }
     });
     document.getElementById("btnDetailDeleteCookies")?.addEventListener("click", async () => {
-      if (!confirm("Clear cookies for this account?")) return;
+      const ok = await confirmModal({
+        title: "Delete cookies",
+        message: `Clear cookies for @${a.username} (ID ${a.id})?\n\nThis will log the account out for browser actions until you paste new cookies.`,
+        okText: "Delete cookies",
+        danger: true,
+      });
+      if (!ok) return;
       try {
         await API.delete(`/api/accounts/${accountId}/cookies`);
         toast("Cookies cleared");
@@ -653,35 +1156,23 @@ async function openAccountDetail(accountId) {
   }
 }
 
-async function submitSellerImport(resultElId = "sellerImportResult") {
-  const fromPanel = document.getElementById("sellerImportText")?.value?.trim();
-  const fromModal = document.getElementById("accSellerText")?.value?.trim();
-  const text = resultElId === "accountImportResult" ? fromModal || fromPanel : fromPanel || fromModal;
-
-  const proxyEl =
-    resultElId === "accountImportResult"
-      ? document.getElementById("accSellerProxyId") || document.getElementById("sellerImportProxyId")
-      : document.getElementById("sellerImportProxyId") || document.getElementById("accSellerProxyId");
-  const proxyId = parseInt(proxyEl?.value || "0", 10);
-
-  const skipEl =
-    resultElId === "accountImportResult"
-      ? document.getElementById("accSellerSkipExisting") || document.getElementById("sellerSkipExisting")
-      : document.getElementById("sellerSkipExisting") || document.getElementById("accSellerSkipExisting");
-  const skip = skipEl?.checked ?? true;
+async function submitSellerImport(resultElId = "accountImportResult") {
+  const text = document.getElementById("accSellerText")?.value?.trim();
+  const proxyId = parseInt(document.getElementById("accSellerProxyId")?.value || "0", 10);
+  const skip = document.getElementById("accSellerSkipExisting")?.checked ?? true;
 
   if (!text) {
     toast("Paste seller format accounts first", "error");
     return;
   }
 
-  const btn = document.getElementById("btnSellerImport");
+  const btn = document.getElementById("btnSubmitAccount");
   setButtonLoading(btn, true);
   try {
-    const autoProxy = document.getElementById("sellerAutoProxy")?.checked ?? false;
+    const autoProxy = document.getElementById("accSellerAutoProxy")?.checked ?? false;
     const r = await API.postJson("/api/accounts/import/seller", {
       accounts: text,
-      proxy_id: proxyId,
+      proxy_id: autoProxy ? 0 : proxyId,
       skip_existing: skip,
       require_cookies: true,
       auto_assign_proxy: autoProxy,
@@ -771,7 +1262,7 @@ function renderProxiesTable() {
             <td class="cell-dim">${escapeHtml(checked)}</td>
             <td>
               <button class="btn btn-sm" type="button" data-check-proxy="${p.id}">Check</button>
-              <button class="btn btn-sm" type="button" data-delete-proxy="${p.id}">Del</button>
+              <button class="btn btn-sm btn-danger" type="button" data-delete-proxy="${p.id}">Delete</button>
             </td>
           </tr>`;
           })
@@ -793,16 +1284,18 @@ function renderProxiesTable() {
   if (typeof lucide !== "undefined") lucide.createIcons();
 }
 
-function confirmDeleteAccount(id) {
+async function deleteAccount(id) {
   const acc = accountsCache.find((a) => a.id === id);
   const label = acc ? `@${acc.username} (ID ${id})` : `account #${id}`;
-  return confirm(
-    `Delete ${label} permanently?\n\nThis removes the account, cookies, and scheduled jobs. This cannot be undone.`
-  );
-}
-
-async function deleteAccount(id) {
-  if (!confirmDeleteAccount(id)) return;
+  const ok = await confirmModal({
+    title: "Delete account",
+    message:
+      `Delete ${label} permanently?\n\n` +
+      "This removes the account, cookies, posts, logs, and alerts. This cannot be undone.",
+    okText: "Delete",
+    danger: true,
+  });
+  if (!ok) return;
   try {
     await API.delete(`/api/accounts/${id}`);
     toast("Account deleted");
@@ -813,7 +1306,16 @@ async function deleteAccount(id) {
 }
 
 async function deleteProxy(id) {
-  if (!confirm(`Delete proxy #${id}? Accounts using it need reassignment.`)) return;
+  const p = proxiesCache.find((x) => x.id === id);
+  const used = (p?.used_by || []).length;
+  const usedList = (p?.used_by || []).slice(0, 8).map((u) => `@${u}`).join(", ");
+  const label = p ? `${p.ip}:${p.port} (${(p.protocol || "http").toUpperCase()})` : `#${id}`;
+  const msg =
+    `Delete proxy ${label}?\n\n` +
+    (used ? `Used by ${used} account(s): ${usedList}${used > 8 ? ", …" : ""}\n\n` : "") +
+    "Accounts using it need reassignment. This cannot be undone.";
+  const ok = await confirmModal({ title: "Delete proxy", message: msg, okText: "Delete", danger: true });
+  if (!ok) return;
   try {
     await API.delete(`/api/proxies/${id}`);
     toast("Proxy deleted");
@@ -995,7 +1497,152 @@ function wsUrl(path) {
   return `${proto}//${location.host}${path}`;
 }
 
+function stopFarmQueuePoll() {
+  if (farmQueuePollTimer) {
+    clearInterval(farmQueuePollTimer);
+    farmQueuePollTimer = null;
+  }
+}
+
+function farmAccountLabel(id) {
+  const acc = accountsCache.find((a) => a.id === id);
+  return acc ? `@${acc.username}` : `#${id}`;
+}
+
+function appendFarmQueueEvent(line, cls = "") {
+  const ev = document.getElementById("farmQueueEvents");
+  if (!ev) {
+    appendLiveLog(line, cls);
+    return;
+  }
+  const el = document.createElement("div");
+  el.className = `live-log-line ${cls}`;
+  el.textContent = line;
+  ev.appendChild(el);
+  ev.scrollTop = ev.scrollHeight;
+}
+
+function renderFarmQueueStatus(q) {
+  const el = document.getElementById("farmQueueStatus");
+  if (!el) return;
+  const running = q.running || [];
+  const pending = q.pending_count ?? (q.pending?.length ?? 0);
+  const st = q.stats || {};
+  const failed = st.failed || Object.keys(q.errors || {}).length;
+  el.innerHTML = `
+    <div class="live-queue-summary">
+      <span class="live-queue-stat live-queue-stat--run"><strong>${running.length}</strong> running</span>
+      <span class="live-queue-stat"><strong>${pending}</strong> waiting</span>
+      <span class="live-queue-stat live-queue-stat--ok"><strong>${st.completed || 0}</strong> done</span>
+      ${failed ? `<span class="live-queue-stat live-queue-stat--err"><strong>${failed}</strong> failed</span>` : ""}
+    </div>
+    <div class="live-queue-meta">Max ${q.max_concurrent ?? 3} parallel · ${q.duration_minutes ?? 15} min/session</div>`;
+}
+
+function updateFarmQueueProgress(q) {
+  const total = farmQueuePollState.total || 0;
+  if (!total) return;
+  const st = q.stats || {};
+  const running = q.running_count ?? (q.running?.length ?? 0);
+  const done = (st.completed || 0) + (st.failed || 0);
+  const pct = Math.min(100, Math.round(((done + running * 0.3) / total) * 100));
+  const bar = document.getElementById("liveProgressBar");
+  if (bar) bar.style.width = `${pct}%`;
+}
+
+async function pollFarmQueue() {
+  try {
+    const q = await API.get("/api/actions/farm/queue");
+    renderFarmQueueStatus(q);
+    updateFarmQueueProgress(q);
+
+    const runsEl = document.getElementById("farmQueueRuns");
+    const running = q.running || [];
+    if (runsEl) {
+      if (!running.length) {
+        runsEl.innerHTML = "";
+      } else {
+        const rows = await Promise.all(
+          running.map(async (id) => {
+            const label = farmAccountLabel(id);
+            try {
+              const r = await API.get(`/api/accounts/${id}/logs?limit=5`);
+              const logs = r.logs || [];
+              const prog = logs.find((l) => l.message === "progress");
+              const det = prog?.details || {};
+              const phase = det.phase || "starting";
+              const sec = det.elapsed_sec != null ? `${det.elapsed_sec}s` : "—";
+              const scrolls = det.scrolls != null ? det.scrolls : "—";
+              return `<div class="live-queue-account"><span class="live-queue-account-name">${escapeHtml(label)}</span><span class="live-queue-account-detail">${escapeHtml(phase)} · ${sec} · ${scrolls} scrolls</span></div>`;
+            } catch {
+              return `<div class="live-queue-account"><span class="live-queue-account-name">${escapeHtml(label)}</span><span class="live-queue-account-detail">starting…</span></div>`;
+            }
+          })
+        );
+        runsEl.innerHTML = rows.join("");
+      }
+    }
+
+    const errors = q.errors || {};
+    const prevRunning = farmQueuePollState.lastRunning;
+    const nowRunning = new Set(running);
+    for (const id of prevRunning) {
+      if (nowRunning.has(id) || farmQueuePollState.finishedIds.has(id)) continue;
+      farmQueuePollState.finishedIds.add(id);
+      const err = errors[String(id)] || errors[id];
+      if (err) appendFarmQueueEvent(`✗ ${farmAccountLabel(id)}: ${err}`, "error");
+      else appendFarmQueueEvent(`✓ ${farmAccountLabel(id)} finished`, "ok");
+    }
+    farmQueuePollState.lastRunning = nowRunning;
+    farmQueuePollState.lastStats = { ...(q.stats || {}) };
+
+    const foot = document.getElementById("liveLogFoot");
+    const idle =
+      !q.worker_active && !q.running_count && !q.pending_count;
+    if (foot) {
+      if (idle) {
+        const st = q.stats || {};
+        foot.textContent = `Done · ${st.completed || 0} completed${st.failed ? `, ${st.failed} failed` : ""}`;
+      } else {
+        foot.textContent = q.worker_active ? "Queue active…" : "Finishing sessions…";
+      }
+    }
+
+    if (idle) {
+      stopFarmQueuePoll();
+      setTimeout(refreshAll, 1500);
+    }
+  } catch (e) {
+    appendFarmQueueEvent(`Poll error: ${e.message}`, "error");
+  }
+}
+
+function showFarmQueueLiveLog(initialQueue, queuedCount) {
+  showLiveLogPanel("Farm queue", null);
+  farmQueuePollState = {
+    total: queuedCount || initialQueue.pending_count + (initialQueue.running_count || 0) || 0,
+    lastRunning: new Set(initialQueue.running || []),
+    lastStats: { ...(initialQueue.stats || {}) },
+    finishedIds: new Set(),
+  };
+  const body = document.getElementById("liveLogBody");
+  if (body) {
+    body.innerHTML = `
+      <div id="farmQueueStatus" class="live-queue-status"></div>
+      <div id="farmQueueRuns" class="live-queue-runs"></div>
+      <div id="farmQueueEvents" class="live-queue-events"></div>`;
+  }
+  renderFarmQueueStatus(initialQueue);
+  updateFarmQueueProgress(initialQueue);
+  appendFarmQueueEvent(`Queued ${queuedCount} account(s)`, "ok");
+  const foot = document.getElementById("liveLogFoot");
+  if (foot) foot.textContent = "Starting workers…";
+  pollFarmQueue();
+  farmQueuePollTimer = setInterval(pollFarmQueue, 3000);
+}
+
 function showLiveLogPanel(title, accountId) {
+  stopFarmQueuePoll();
   const panel = document.getElementById("liveLogPanel");
   if (!panel) return;
   panel.hidden = false;
@@ -1009,6 +1656,7 @@ function showLiveLogPanel(title, accountId) {
 }
 
 function hideLiveLogPanel() {
+  stopFarmQueuePoll();
   if (liveWs) {
     liveWs.close();
     liveWs = null;
@@ -1348,6 +1996,18 @@ function updateBatchSourceRows() {
   if (batchCurrentStep === 4) updateBatchReviewSummary();
 }
 
+function setBatchSource(mode) {
+  const val = mode === "upload" ? "upload" : "folder";
+  const radio = document.querySelector(`input[name="batchSource"][value="${val}"]`);
+  if (radio) radio.checked = true;
+  document.querySelectorAll(".batch-source-tab").forEach((btn) => {
+    const active = btn.dataset.batchSource === val;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  updateBatchSourceRows();
+}
+
 function getBatchSourceMeta() {
   const useFolder = document.querySelector('input[name="batchSource"]:checked')?.value === "folder";
   const serverPath = document.getElementById("batchFolderPath")?.value?.trim() || "";
@@ -1502,7 +2162,7 @@ function openBatchSchedule(accountId) {
   document.getElementById("batchScheduleAccountId").value = String(accountId);
   document.getElementById("batchScheduleTitle").textContent =
     `Batch schedule — @${acc?.username || accountId}`;
-  document.querySelector('input[name="batchSource"][value="folder"]').checked = true;
+  setBatchSource("folder");
   batchFolderVideoFiles = [];
   document.getElementById("batchFolderPath").value = "";
   const folderPicker = document.getElementById("batchFolderPicker");
@@ -1525,7 +2185,6 @@ function openBatchSchedule(accountId) {
   document.getElementById("batchReviewFiles").innerHTML = "";
   document.getElementById("batchQueuePreview").innerHTML =
     '<p class="form-hint">Pending scheduled posts for this account.</p>';
-  updateBatchSourceRows();
   setBatchStep(1);
   openModal("modalBatchSchedule");
   if (typeof lucide !== "undefined") lucide.createIcons();
@@ -2014,10 +2673,41 @@ async function refreshSettings() {
   const wrap = document.getElementById("settingsPanel");
   if (!wrap) return;
   try {
-    const r = await API.get("/api/profile/status");
-    const s = r.status || {};
+    const [farmRes, profileRes] = await Promise.all([
+      API.get("/api/settings/farm"),
+      API.get("/api/profile/status"),
+    ]);
+    const maxC = farmRes.max_concurrent ?? 3;
+    const sessionMin = farmRes.session_minutes ?? 15;
+    const q = farmRes.queue || {};
+    const s = profileRes.status || {};
     const ready = s.ready;
     wrap.innerHTML = `
+      <div class="settings-card">
+        <h4><i data-lucide="sprout" style="width:16px;height:16px"></i> Farm queue</h4>
+        <p class="form-hint" style="margin:0 0 0.75rem">
+          Bulk farm and scheduler share this limit. Accounts beyond the limit wait in queue.
+        </p>
+        <div class="field-row field-row--stack">
+          <label for="farmMaxConcurrent">Parallel accounts (1–10)</label>
+          <input type="number" id="farmMaxConcurrent" min="1" max="10" step="1" value="${maxC}" />
+        </div>
+        <div class="field-row field-row--stack">
+          <label for="farmSessionMinutes">Session length (minutes, 5–120)</label>
+          <input type="number" id="farmSessionMinutes" min="5" max="120" step="1" value="${sessionMin}" />
+        </div>
+        <div class="status-line" style="margin-top:0.5rem">
+          Queue: <strong>${q.running_count ?? 0}</strong> running
+          · <strong>${q.pending_count ?? 0}</strong> pending
+          · max <code>${q.max_concurrent ?? maxC}</code> parallel
+        </div>
+        <div class="field-row" style="margin-top:0.75rem">
+          <button class="btn btn-sm btn-primary" type="button" id="btnSaveFarmSettings">
+            <i data-lucide="save"></i> Save farm settings
+          </button>
+        </div>
+        <div id="farmSettingsResult" style="margin-top:0.5rem"></div>
+      </div>
       <div class="settings-card">
         <h4><i data-lucide="scan" style="width:16px;height:16px"></i> Profile Scanner</h4>
         <div class="status-line">
@@ -2044,9 +2734,42 @@ async function refreshSettings() {
       </div>`;
 
     if (typeof lucide !== "undefined") lucide.createIcons();
+    document.getElementById("btnSaveFarmSettings")?.addEventListener("click", saveFarmSettings);
     document.getElementById("btnTestProfileScan")?.addEventListener("click", testProfileScan);
   } catch (e) {
     wrap.innerHTML = `<div class="empty-state">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function saveFarmSettings() {
+  const result = document.getElementById("farmSettingsResult");
+  const btn = document.getElementById("btnSaveFarmSettings");
+  const maxEl = document.getElementById("farmMaxConcurrent");
+  const minEl = document.getElementById("farmSessionMinutes");
+  const max_concurrent = parseInt(maxEl?.value, 10);
+  const session_minutes = parseInt(minEl?.value, 10);
+  if (!Number.isFinite(max_concurrent) || max_concurrent < 1 || max_concurrent > 10) {
+    toast("Parallel accounts must be 1–10", "error");
+    return;
+  }
+  if (!Number.isFinite(session_minutes) || session_minutes < 5 || session_minutes > 120) {
+    toast("Session length must be 5–120 minutes", "error");
+    return;
+  }
+  setButtonLoading(btn, true);
+  if (result) result.innerHTML = '<span style="color:var(--text-muted)">Saving…</span>';
+  try {
+    const r = await API.patch("/api/settings/farm", { max_concurrent, session_minutes });
+    if (result) {
+      result.innerHTML = `<span style="color:var(--success)">Saved — ${r.max_concurrent} parallel, ${r.session_minutes} min/session</span>`;
+    }
+    toast(`Farm settings saved (${r.max_concurrent} parallel)`);
+    await refreshSettings();
+  } catch (e) {
+    if (result) result.innerHTML = `<span style="color:var(--danger)">${escapeHtml(e.message)}</span>`;
+    toast(e.message, "error");
+  } finally {
+    setButtonLoading(btn, false);
   }
 }
 
@@ -2163,36 +2886,120 @@ function closeModal(id) {
   if (id === "modalAccountLogs") closeAccountLogsPanel();
 }
 
+// Custom confirm modal (avoid native confirm() being hidden/auto-accepted)
+let _confirmModalResolve = null;
+function confirmModal({ title = "Confirm", message = "", okText = "OK", danger = false } = {}) {
+  return new Promise((resolve) => {
+    _confirmModalResolve = resolve;
+    const t = document.getElementById("confirmTitle");
+    const b = document.getElementById("confirmBody");
+    const ok = document.getElementById("btnConfirmOk");
+    if (t) t.textContent = title;
+    if (b) b.textContent = message;
+    if (ok) {
+      ok.textContent = okText;
+      ok.classList.toggle("btn-danger", !!danger);
+      ok.classList.toggle("btn-primary", !danger);
+    }
+    openModal("modalConfirm");
+  });
+}
+
+function initConfirmModal() {
+  const ok = document.getElementById("btnConfirmOk");
+  if (ok && !ok.dataset.bound) {
+    ok.dataset.bound = "1";
+    ok.addEventListener("click", () => {
+      closeModal("modalConfirm");
+      if (_confirmModalResolve) _confirmModalResolve(true);
+      _confirmModalResolve = null;
+    });
+  }
+  const cancel = document.getElementById("btnConfirmCancel");
+  if (cancel && !cancel.dataset.bound) {
+    cancel.dataset.bound = "1";
+    cancel.addEventListener("click", () => {
+      if (_confirmModalResolve) _confirmModalResolve(false);
+      _confirmModalResolve = null;
+    });
+  }
+  // If user closes backdrop/X, resolve false to avoid hanging promise
+  document.querySelectorAll("#modalConfirm [data-close]").forEach((btn) => {
+    if (btn.dataset.bound) return;
+    btn.dataset.bound = "1";
+    btn.addEventListener("click", () => {
+      if (_confirmModalResolve) _confirmModalResolve(false);
+      _confirmModalResolve = null;
+    });
+  });
+}
+
 function setupModalTabs(modalId, kind) {
   const modal = document.getElementById(modalId);
   if (!modal) return;
   modal.querySelectorAll(".modal-tabs .tab").forEach((tab) => {
-    tab.addEventListener("click", () => {
+    tab.addEventListener("click", (e) => {
+      e.preventDefault();
       const name = tab.dataset.tab;
+      if (!name) return;
       modal.querySelectorAll(".modal-tabs .tab").forEach((t) => t.classList.toggle("active", t === tab));
       modal.querySelectorAll(".tab-panel").forEach((p) => {
         p.hidden = p.id !== name;
       });
-      if (kind === "account") accountModalTab = name;
-      else proxyModalTab = name;
+      if (kind === "account") {
+        accountModalTab = name;
+        updateAccountModalSubmitLabel(name);
+      } else proxyModalTab = name;
     });
   });
+}
+
+function updateAccountModalSubmitLabel(tab) {
+  const btn = document.getElementById("btnSubmitAccount");
+  if (!btn) return;
+  if (tab === "account-seller") {
+    btn.innerHTML = '<i data-lucide="upload"></i> Import accounts';
+  } else if (tab === "account-bulk") {
+    btn.innerHTML = '<i data-lucide="upload"></i> Import CSV';
+  } else {
+    btn.textContent = "Save";
+  }
+  if (typeof lucide !== "undefined") lucide.createIcons();
+}
+
+function formatImportErrors(result) {
+  const lines = [];
+  for (const e of (result.parse_errors || []).slice(0, 5)) {
+    lines.push(`Line ${e.row}: ${escapeHtml(e.error || "parse error")}`);
+  }
+  for (const e of (result.errors || []).slice(0, 5)) {
+    const who = e.username ? `@${e.username}` : `row ${e.row}`;
+    lines.push(`${who}: ${escapeHtml(e.error || "failed")}`);
+  }
+  if (!lines.length) return "";
+  const more =
+    (result.parse_errors || []).length + (result.errors || []).length - lines.length;
+  return (
+    `<br><span style="color:var(--warning)">${lines.join("<br>")}` +
+    (more > 0 ? `<br>…and ${more} more` : "") +
+    "</span>"
+  );
 }
 
 function showImportResult(elId, result) {
   const el = document.getElementById(elId);
   if (!el) return;
   const errCount = (result.errors || []).length;
-  el.className = "import-result show" + (errCount ? " has-errors" : "");
   const parseErr = (result.parse_errors || []).length;
+  el.className =
+    "import-result show" + (errCount || parseErr ? " has-errors" : "");
   el.innerHTML = `
     <strong>Import complete</strong><br>
     Imported: ${result.imported ?? 0} · Skipped: ${result.skipped ?? 0} · Failed: ${result.failed ?? 0}
     ${result.with_cookies != null ? `<br>With cookies: ${result.with_cookies}` : ""}
     ${result.without_cookies != null ? `<br>Missing cookies: ${result.without_cookies}` : ""}
     ${result.total_rows != null ? `<br>Rows in file: ${result.total_rows}` : ""}
-    ${parseErr ? `<br><span style="color:var(--warning)">${parseErr} parse error(s)</span>` : ""}
-    ${errCount ? `<br><span style="color:var(--warning)">${errCount} row error(s)</span>` : ""}`;
+    ${formatImportErrors(result)}`;
 }
 
 async function submitAccountModal() {
@@ -2235,7 +3042,13 @@ async function submitAccountModal() {
         status: document.getElementById("accStatus")?.value || "pending",
       };
       const cookies = document.getElementById("accCookies")?.value?.trim();
-      if (cookies) payload.cookie_data = cookies;
+      if (cookies) {
+        payload.cookie_data = cookies;
+        // If user pasted cookies, default to active (they can pause later).
+        payload.status = "active";
+      } else {
+        payload.status = "pending";
+      }
       await API.postJson("/api/accounts", payload);
       toast(`Account @${username} created`);
       closeModal("modalAccount");
@@ -2305,6 +3118,7 @@ function openAccountModal(tab = "account-single") {
   }
   accountModalTab = tab;
   document.querySelector(`#modalAccount .tab[data-tab=${tab}]`)?.click();
+  updateAccountModalSubmitLabel(tab);
   openModal("modalAccount");
 }
 
@@ -2316,10 +3130,24 @@ function openProxyModal(tab = "proxy-single") {
 }
 
 function initModals() {
+  initConfirmModal();
   setupModalTabs("modalAccount", "account");
   setupModalTabs("modalProxy", "proxy");
 
-  document.getElementById("btnAddAccount")?.addEventListener("click", () => openAccountModal());
+  const addAccountDd = document.getElementById("addAccountDropdown");
+  document.getElementById("btnAddAccount")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    document.querySelectorAll(".actions-dropdown.open").forEach((d) => {
+      if (d !== addAccountDd) d.classList.remove("open");
+    });
+    addAccountDd?.classList.toggle("open");
+  });
+  addAccountDd?.querySelectorAll("[data-account-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      addAccountDd?.classList.remove("open");
+      openAccountModal(btn.dataset.accountTab);
+    });
+  });
   document.getElementById("navAddAccount")?.addEventListener("click", () => openAccountModal());
   document.getElementById("btnImportAccounts")?.addEventListener("click", () =>
     openAccountModal("account-bulk")
@@ -2366,8 +3194,12 @@ function initModals() {
     updateBatchStep2Preview();
     if (batchCurrentStep === 4) updateBatchReviewSummary();
   });
+  // Source tabs -> radios
+  document.querySelectorAll(".batch-source-tab").forEach((btn) => {
+    btn.addEventListener("click", () => setBatchSource(btn.dataset.batchSource));
+  });
   document.querySelectorAll('input[name="batchSource"]').forEach((el) => {
-    el.addEventListener("change", updateBatchSourceRows);
+    el.addEventListener("change", () => setBatchSource(el.value));
   });
   document.querySelectorAll("[data-batch-step]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -2426,8 +3258,10 @@ function initModals() {
 
   document.getElementById("accountSearch")?.addEventListener("input", () => {
     accountPage = 1;
+    updateAccountFiltersUi();
     renderAccountsTable();
   });
+  initAccountFilters();
   document.getElementById("proxySearch")?.addEventListener("input", () => {
     proxyPage = 1;
     renderProxiesTable();
@@ -2463,10 +3297,6 @@ function init() {
   document.getElementById("btnReschedule")?.addEventListener("click", rescheduleJobs);
   document.getElementById("btnAffiliateScan")?.addEventListener("click", scanAffiliateProducts);
   document.getElementById("btnAffiliateRefresh")?.addEventListener("click", refreshAffiliate);
-  document.getElementById("btnSellerImport")?.addEventListener("click", () =>
-    submitSellerImport("sellerImportResult")
-  );
-
   refreshAll();
   refreshTimer = setInterval(refreshAll, 60000);
 }

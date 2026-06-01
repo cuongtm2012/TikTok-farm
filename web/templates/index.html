@@ -93,7 +93,7 @@
           <span class="nav-label">Configuration</span>
           <ul class="nav-list">
             <li>
-              <a href="#settings" class="nav-link" data-section="settings" data-title="Settings" data-subtitle="TikTok API &amp; system config">
+              <a href="#settings" class="nav-link" data-section="settings" data-title="Settings" data-subtitle="Farm queue, profile scanner &amp; config">
                 <i data-lucide="settings"></i>
                 <span class="nav-link-text">Settings</span>
               </a>
@@ -203,9 +203,15 @@
           </h2>
           <div class="section-actions">
             <input type="search" class="search-input" id="accountSearch" placeholder="Search username…" aria-label="Search accounts">
-            <button class="btn btn-sm" type="button" id="btnAddAccount">
-              <i data-lucide="user-plus"></i> Add
-            </button>
+            <div class="dropdown actions-dropdown" id="addAccountDropdown">
+              <button class="btn btn-sm dropdown-toggle" type="button" id="btnAddAccount">
+                <i data-lucide="user-plus"></i> Add account ▼
+              </button>
+              <div class="dropdown-menu">
+                <button type="button" data-account-tab="account-single">Add one</button>
+                <button type="button" data-account-tab="account-seller">Fast import (Seller format)</button>
+              </div>
+            </div>
             <button class="btn btn-sm" type="button" id="btnImportAccounts">
               <i data-lucide="upload"></i> Import CSV
             </button>
@@ -217,30 +223,71 @@
             </button>
           </div>
         </div>
-        <div class="panel seller-import-panel">
-          <h3 class="seller-import-title">
-            <i data-lucide="clipboard-paste"></i> Fast import (Seller format)
-          </h3>
-          <p class="form-hint">USER|PASS|EMAIL|EMAIL_PASS|COOKIES|UID — one account per line</p>
-          <textarea id="sellerImportText" rows="6" placeholder="user1|pass1|email@hm.com|mailpass|sessionid=xxx; msToken=yyy|uid123"></textarea>
-          <div class="seller-import-actions">
-            <label class="form-row-inline">
-              Default proxy
-              <select id="sellerImportProxyId" class="search-input" style="width:auto;min-width:10rem">
-                <option value="0">— None / auto —</option>
+        <div class="accounts-toolbar" id="accountsFilters" aria-label="Account filters and bulk actions">
+          <div class="accounts-toolbar-filters">
+            <span class="accounts-toolbar-heading">Filter</span>
+            <div class="accounts-filter-group">
+              <span class="accounts-filter-label">Status</span>
+              <div class="filter-chips" id="accountFilterStatus" role="group" aria-label="Filter by status">
+                <button type="button" class="btn btn-sm filter-chip active" data-filter-status="">All</button>
+                <button type="button" class="btn btn-sm filter-chip" data-filter-status="active">Active</button>
+                <button type="button" class="btn btn-sm filter-chip" data-filter-status="warming">Warming</button>
+                <button type="button" class="btn btn-sm filter-chip" data-filter-status="pending">Pending</button>
+                <button type="button" class="btn btn-sm filter-chip" data-filter-status="paused">Paused</button>
+                <button type="button" class="btn btn-sm filter-chip" data-filter-status="banned">Banned</button>
+                <button type="button" class="btn btn-sm filter-chip" data-filter-status="shadowbanned">Shadow</button>
+              </div>
+            </div>
+            <div class="accounts-filter-group">
+              <label class="accounts-filter-label" for="accountFilterCookies">Cookies</label>
+              <select id="accountFilterCookies" class="filter-select">
+                <option value="">All</option>
+                <option value="ok">Valid (sessionid)</option>
+                <option value="warn">Missing / expired</option>
+                <option value="none">No cookies</option>
               </select>
-            </label>
-            <label class="form-check">
-              <input type="checkbox" id="sellerAutoProxy" title="Assign alive proxies when ID is 0"> Auto-assign proxy
-            </label>
-            <label class="form-check">
-              <input type="checkbox" id="sellerSkipExisting" checked> Skip existing
-            </label>
-            <button type="button" class="btn btn-primary btn-sm" id="btnSellerImport">
-              <i data-lucide="upload"></i> Import accounts
+            </div>
+            <div class="accounts-filter-group">
+              <label class="accounts-filter-label" for="accountFilterProxy">Proxy</label>
+              <select id="accountFilterProxy" class="filter-select">
+                <option value="">All</option>
+                <option value="assigned">Has proxy</option>
+                <option value="none">No proxy</option>
+              </select>
+            </div>
+            <button type="button" class="btn btn-sm accounts-filter-clear" id="btnClearAccountFilters" hidden>
+              Clear filters
             </button>
           </div>
-          <div class="import-result" id="sellerImportResult"></div>
+          <div class="accounts-toolbar-bulk" id="accountsBulkBar" hidden>
+            <span class="accounts-toolbar-heading">Bulk</span>
+            <span class="accounts-bulk-count" id="accountsBulkCount">0 selected</span>
+            <button type="button" class="btn btn-sm" id="btnSelectAllFiltered" hidden>Select all filtered</button>
+            <select id="accountsBulkAction" class="filter-select accounts-bulk-action-select" aria-label="Bulk action">
+              <option value="">— Choose action —</option>
+              <optgroup label="Change status">
+                <option value="status:active">Set status → Active</option>
+                <option value="status:warming">Set status → Warming</option>
+                <option value="status:pending">Set status → Pending</option>
+                <option value="status:paused">Set status → Paused</option>
+              </optgroup>
+              <optgroup label="Change proxy">
+                <option value="proxy:assign">Assign proxy (pick below)</option>
+                <option value="proxy:auto">Auto-assign proxy (least used)</option>
+              </optgroup>
+              <optgroup label="Run">
+                <option value="sync">Sync TikTok profile</option>
+                <option value="check">Check login</option>
+                <option value="farm">Farm (queue, 3 parallel)</option>
+                <option value="delete">Delete accounts</option>
+              </optgroup>
+            </select>
+            <select id="accountsBulkProxy" class="filter-select accounts-bulk-proxy-pick" hidden aria-label="Proxy to assign">
+              <option value="0">— None —</option>
+            </select>
+            <button type="button" class="btn btn-sm btn-primary" id="accountsBulkRun">Run</button>
+            <button type="button" class="btn btn-sm accounts-bulk-clear" id="accountsBulkClear">Clear selection</button>
+          </div>
         </div>
         <div class="table-wrap" id="accountsTable">
           <div class="empty-state">Loading accounts…</div>
@@ -375,9 +422,28 @@
     </div>
   </div>
 
+  <!-- Confirm modal -->
+  <div class="modal-backdrop" id="modalConfirm" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+    <div class="modal modal-lg confirm-modal">
+      <div class="modal-header">
+        <h3 id="confirmTitle">Confirm</h3>
+        <button type="button" class="modal-close" data-close="modalConfirm" aria-label="Close">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="confirmBody" class="confirm-body"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" id="btnConfirmCancel" data-close="modalConfirm">Cancel</button>
+        <button type="button" class="btn btn-danger" id="btnConfirmOk">Delete</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Account modal -->
   <div class="modal-backdrop" id="modalAccount" role="dialog" aria-modal="true" aria-labelledby="modalAccountTitle">
-    <div class="modal modal-lg">
+    <div class="modal modal-full account-modal">
       <div class="modal-header">
         <h3 id="modalAccountTitle">Manage accounts</h3>
         <button type="button" class="modal-close" data-close="modalAccount" aria-label="Close">
@@ -413,14 +479,12 @@
               <label for="accPassword">Password (web login)</label>
               <input id="accPassword" type="password" placeholder="optional" autocomplete="new-password">
             </div>
+            <input type="hidden" id="accStatus" value="pending">
             <div class="form-row">
-              <label for="accStatus">Status</label>
-              <select id="accStatus">
-                <option value="pending">pending</option>
-                <option value="warming">warming</option>
-                <option value="active">active</option>
-                <option value="paused">paused</option>
-              </select>
+              <label>Status</label>
+              <div class="form-hint" style="margin-top:0">
+                Auto: <strong>active</strong> nếu có cookies, ngược lại <strong>pending</strong>.
+              </div>
             </div>
             <div class="form-row">
               <label for="accNotes">Notes</label>
@@ -449,18 +513,22 @@
             <p class="form-hint">Columns: username, proxy_id, password, status, notes, cookie_data</p>
           </div>
         </div>
-        <div id="account-seller" class="tab-panel" hidden>
-          <div class="form-grid">
-            <div class="form-row">
-              <label for="accSellerText">Paste seller lines</label>
-              <textarea id="accSellerText" rows="8" placeholder="USER|PASS|EMAIL|EMAIL_PASS|COOKIES|UID"></textarea>
-            </div>
-            <div class="form-row">
-              <label for="accSellerProxyId">Default proxy</label>
-              <select id="accSellerProxyId">
+        <div id="account-seller" class="tab-panel seller-import-panel" hidden>
+          <h3 class="seller-import-title">
+            <i data-lucide="clipboard-paste"></i> Fast import (Seller format)
+          </h3>
+          <p class="form-hint">USER|PASS|EMAIL|EMAIL_PASS|COOKIES|UID — one per line. COOKIES: <code>sessionid=…; msToken=…</code>, bare sessionid token, or JSON.</p>
+          <textarea id="accSellerText" rows="6" placeholder="user1|pass1|email@hm.com|mailpass|sessionid=xxx; msToken=yyy|uid123&#10;user2|pass2|sessionid=only_three_fields_ok"></textarea>
+          <div class="seller-import-actions">
+            <label class="form-row-inline">
+              Default proxy
+              <select id="accSellerProxyId" class="search-input" style="width:auto;min-width:10rem">
                 <option value="0">— None / auto —</option>
               </select>
-            </div>
+            </label>
+            <label class="form-check">
+              <input type="checkbox" id="accSellerAutoProxy" title="Pick the least-used alive proxy (one account per proxy when possible)"> Auto-assign proxy
+            </label>
             <label class="form-check">
               <input type="checkbox" id="accSellerSkipExisting" checked> Skip existing
             </label>
@@ -477,7 +545,7 @@
 
   <!-- Account detail (cookies) -->
   <div class="modal-backdrop" id="modalAccountDetail" role="dialog" aria-modal="true">
-    <div class="modal modal-lg">
+    <div class="modal modal-full account-detail-modal">
       <div class="modal-header">
         <h3 id="accountDetailTitle">Account</h3>
         <button type="button" class="modal-close" data-close="modalAccountDetail" aria-label="Close">
@@ -668,10 +736,16 @@
               </header>
               <div class="batch-step-card">
                 <label class="batch-field-label">Source type</label>
-                <div class="post-type-toggle">
-                  <label><input type="radio" name="batchSource" value="folder" checked> Browse folder</label>
-                  <label><input type="radio" name="batchSource" value="upload"> Browse files</label>
+                <div class="batch-source-tabs" role="tablist" aria-label="Batch video source">
+                  <button type="button" class="batch-source-tab active" role="tab" aria-selected="true" data-batch-source="folder">
+                    Browse folder
+                  </button>
+                  <button type="button" class="batch-source-tab" role="tab" aria-selected="false" data-batch-source="upload">
+                    Browse files
+                  </button>
                 </div>
+                <input type="radio" name="batchSource" value="folder" checked hidden>
+                <input type="radio" name="batchSource" value="upload" hidden>
               </div>
               <div class="batch-step-card" id="batchFolderRow">
                 <label class="batch-field-label">Video folder</label>

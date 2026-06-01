@@ -527,6 +527,39 @@ class ProxyManager:
     def get_usage_map(self, db) -> Dict[int, List[str]]:
         return self._accounts_by_proxy_id(db)
 
+    def pick_proxy_for_import(
+        self, db, reserved: Optional[Dict[int, int]] = None
+    ) -> Optional[Proxy]:
+        """
+        Pick an alive proxy with the fewest accounts (spread load, prefer empty slots).
+        reserved: in-batch counts {proxy_id: n} for multi-line seller import.
+        """
+        alive = self.get_alive_proxies()
+        if not alive:
+            return None
+        usage = self.get_usage_map(db)
+        reserved = reserved or {}
+
+        def load(p: Proxy) -> int:
+            return len(usage.get(p.id, [])) + int(reserved.get(p.id, 0))
+
+        empty = [p for p in alive if load(p) == 0]
+        if empty:
+            return sorted(empty, key=lambda p: p.id)[0]
+        return min(alive, key=lambda p: (load(p), p.id))
+
+    def assign_proxies_for_import_items(self, db, items: List[dict]) -> None:
+        """Set proxy_id on import rows with proxy_id=0 using least-loaded alive proxies."""
+        reserved: Dict[int, int] = {}
+        for item in items:
+            if int(item.get("proxy_id") or 0) != 0:
+                continue
+            proxy = self.pick_proxy_for_import(db, reserved)
+            if not proxy:
+                continue
+            item["proxy_id"] = proxy.id
+            reserved[proxy.id] = reserved.get(proxy.id, 0) + 1
+
     def sync_proxies_to_db(self, db, account_manager=None) -> Dict[str, int]:
         """Sync proxies.csv → DB; remove orphans; migrate accounts off deprecated proxies."""
         stats = {

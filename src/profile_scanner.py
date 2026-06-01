@@ -68,6 +68,69 @@ def parse_count_text(raw: str) -> int:
         return int(digits) if digits else 0
 
 
+# Number before label — EN + VI (body text is lowercased before matching)
+_COUNTER_BODY_PATTERNS = {
+    "following": [
+        r"([\d.,]+[kmb]?)\s*(?:following|đã\s*follow|đang\s*follow|subscriptions?)\b",
+    ],
+    "followers": [
+        r"([\d.,]+[kmb]?)\s*(?:followers?|người\s*follow|fan)\b",
+    ],
+    "likes": [
+        r"([\d.,]+[kmb]?)\s*(?:likes?|lượt\s*thích|tim)\b",
+    ],
+}
+
+_NUMERIC_STAT_KEYS = ("followers", "following", "likes", "total_posts")
+
+
+def extract_counters_from_body_text(body_text: str) -> Dict[str, Any]:
+    """Parse labeled counters from visible page text (EN/VI)."""
+    data: Dict[str, Any] = {}
+    if not body_text:
+        return data
+    text = body_text.lower()
+    for key, patterns in _COUNTER_BODY_PATTERNS.items():
+        for pat in patterns:
+            m = re.search(pat, text, re.I)
+            if m:
+                data[key] = parse_count_text(m.group(1))
+                data["stats_extracted"] = True
+                break
+    return data
+
+
+def merge_profile_stats(*sources: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge extractions; later sources override (JSON / body over DOM)."""
+    merged: Dict[str, Any] = {
+        "display_name": "",
+        "bio": "",
+        "avatar_url": "",
+        "followers": 0,
+        "following": 0,
+        "likes": 0,
+        "total_posts": 0,
+        "verified": False,
+        "private_account": False,
+    }
+    for src in sources:
+        if not src:
+            continue
+        for key in ("display_name", "bio", "avatar_url"):
+            if src.get(key):
+                merged[key] = src[key]
+        for key in _NUMERIC_STAT_KEYS:
+            if key in src and src[key] is not None:
+                merged[key] = int(src[key] or 0)
+        if src.get("verified"):
+            merged["verified"] = True
+        if src.get("private_account"):
+            merged["private_account"] = True
+        if src.get("stats_extracted") or src.get("_json_stats"):
+            merged["stats_extracted"] = True
+    return merged
+
+
 def _fail(username: str, error: str, error_type: str) -> Dict[str, Any]:
     return {
         "success": False,
@@ -329,13 +392,7 @@ class ProfileScanner:
                     hint += "If cookies are old, paste fresh cookies and sync again."
                 return _fail(username, hint.strip(), "not_found")
 
-            if self._is_private(body_text):
-                display = await self._text(page, "[data-e2e='user-title'], h1, .share-title")
-                return _ok(
-                    username,
-                    display_name=display or username,
-                    private_account=True,
-                )
+            private_flag = self._is_private(body_text)
 
             try:
                 await page.wait_for_selector(
@@ -346,11 +403,11 @@ class ProfileScanner:
             except PlaywrightTimeout:
                 pass
 
-            parsed = await self._extract_from_dom(page)
-            parsed = await self._extract_from_embedded_json(page, parsed)
-            parsed = await self._extract_from_body_counters(body_text, parsed)
-            if not parsed.get("stats_extracted"):
-                parsed = await self._extract_fallback(page, username, parsed)
+            dom = await self._extract_from_dom(page)
+            body = extract_counters_from_body_text(body_text)
+            json_stats = await self._extract_json_stats(page)
+            fallback = await self._extract_fallback(page, username, {})
+            parsed = merge_profile_stats(dom, fallback, body, json_stats, {"private_account": private_flag})
 
             if not _profile_stats_readable(parsed, body_text):
                 return _fail(
@@ -386,6 +443,36 @@ class ProfileScanner:
             pass
         return ""
 
+    async def _parse_count_element(self, el) -> int:
+        """Prefer title attribute (full number) over abbreviated visible text."""
+        try:
+            title = await el.get_attribute("title")
+            if title and re.search(r"[\d]", title):
+                val = parse_count_text(title)
+                if val > 0:
+                    return val
+            txt = (await el.inner_text()).strip()
+            if txt:
+                return parse_count_text(txt)
+        except Exception:
+            pass
+        return 0
+
+    async def _read_stat(self, page, selector_csv: str) -> int:
+        for sel in selector_csv.split(","):
+            sel = sel.strip()
+            if not sel:
+                continue
+            try:
+                elements = await page.query_selector_all(sel)
+            except Exception:
+                elements = []
+            for el in elements:
+                val = await self._parse_count_element(el)
+                if val > 0:
+                    return val
+        return 0
+
     async def _extract_from_dom(self, page) -> Dict[str, Any]:
         data: Dict[str, Any] = {
             "display_name": "",
@@ -420,28 +507,29 @@ class ProfileScanner:
 
         # data-e2e counters (current TikTok layout)
         e2e_map = {
-            "followers": "[data-e2e='followers-count'], [data-e2e='user-follower-count']",
             "following": "[data-e2e='following-count'], [data-e2e='user-following-count']",
+            "followers": "[data-e2e='followers-count'], [data-e2e='user-follower-count']",
             "likes": "[data-e2e='likes-count'], [data-e2e='user-likes-count']",
         }
         for key, sel in e2e_map.items():
-            txt = await self._text(page, sel)
-            if txt is not None and str(txt).strip() != "":
-                data[key] = parse_count_text(txt)
+            val = await self._read_stat(page, sel)
+            if val > 0:
+                data[key] = val
                 data["stats_extracted"] = True
 
-        # Legacy .count-infos layout
+        # Legacy .count-infos — TikTok order: Following | Followers | Likes
         try:
             counts = await page.query_selector_all(".count-infos .count, .count-infos strong")
             texts = []
             for el in counts[:5]:
                 t = (await el.inner_text()).strip()
-                if t:
+                if t and re.search(r"[\d]", t):
                     texts.append(t)
-            if len(texts) >= 3 and not data["followers"]:
-                data["followers"] = parse_count_text(texts[0])
-                data["following"] = parse_count_text(texts[1])
+            if len(texts) >= 3 and not any(data.get(k) for k in ("followers", "following", "likes")):
+                data["following"] = parse_count_text(texts[0])
+                data["followers"] = parse_count_text(texts[1])
                 data["likes"] = parse_count_text(texts[2])
+                data["stats_extracted"] = True
         except Exception:
             pass
 
@@ -452,11 +540,9 @@ class ProfileScanner:
 
         return data
 
-    async def _extract_from_embedded_json(
-        self, page, partial: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Parse SIGI_STATE / universal data JSON blobs in page HTML."""
-        data = dict(partial)
+    async def _extract_json_stats(self, page) -> Dict[str, Any]:
+        """Parse SIGI_STATE / universal data JSON (authoritative follower counts)."""
+        data: Dict[str, Any] = {}
         try:
             for script_id in (
                 "__UNIVERSAL_DATA_FOR_REHYDRATION__",
@@ -471,12 +557,9 @@ class ProfileScanner:
                 blob = json.loads(raw)
                 stats = self._stats_from_json_blob(blob)
                 if stats:
+                    data.update(stats)
                     data["_json_stats"] = True
                     data["stats_extracted"] = True
-                for k, v in stats.items():
-                    if k not in data or not data.get(k):
-                        data[k] = v
-                if stats:
                     break
         except Exception as e:
             logger.debug(f"embedded JSON extract: {e}")
@@ -489,16 +572,35 @@ class ProfileScanner:
 
         def walk(node):
             if isinstance(node, dict):
-                if "followerCount" in node and isinstance(node["followerCount"], (int, float)):
-                    found["followers"] = int(node["followerCount"])
-                if "followingCount" in node and isinstance(node["followingCount"], (int, float)):
-                    found["following"] = int(node["followingCount"])
-                if "heart" in node and isinstance(node["heart"], (int, float)):
-                    found["likes"] = int(node["heart"])
-                if "heartCount" in node and isinstance(node["heartCount"], (int, float)):
-                    found["likes"] = int(node["heartCount"])
-                if "videoCount" in node and isinstance(node["videoCount"], (int, float)):
-                    found["total_posts"] = int(node["videoCount"])
+                def _as_int(val: Any) -> Optional[int]:
+                    if isinstance(val, (int, float)):
+                        return int(val)
+                    if isinstance(val, str):
+                        digits = re.sub(r"[^\d]", "", val)
+                        return int(digits) if digits else None
+                    return None
+
+                if "followerCount" in node:
+                    v = _as_int(node.get("followerCount"))
+                    if v is not None:
+                        found["followers"] = v
+                if "followingCount" in node:
+                    v = _as_int(node.get("followingCount"))
+                    if v is not None:
+                        found["following"] = v
+                # TikTok JSON blobs sometimes use either "heart" or "heartCount" for likes.
+                if "heart" in node:
+                    v = _as_int(node.get("heart"))
+                    if v is not None:
+                        found["likes"] = v
+                if "heartCount" in node:
+                    v = _as_int(node.get("heartCount"))
+                    if v is not None:
+                        found["likes"] = v
+                if "videoCount" in node:
+                    v = _as_int(node.get("videoCount"))
+                    if v is not None:
+                        found["total_posts"] = v
                 for v in node.values():
                     walk(v)
             elif isinstance(node, list):
@@ -510,20 +612,10 @@ class ProfileScanner:
 
     @staticmethod
     async def _extract_from_body_counters(body_text: str, partial: Dict[str, Any]) -> Dict[str, Any]:
-        """Parse '0 Following 0 Followers 0 Likes' from visible page text."""
+        """Parse labeled counters from visible page text (EN/VI)."""
         data = dict(partial)
-        if not body_text:
-            return data
-        patterns = {
-            "following": r"([\d.,]+[KMB]?)\s*Following",
-            "followers": r"([\d.,]+[KMB]?)\s*Followers",
-            "likes": r"([\d.,]+[KMB]?)\s*Likes",
-        }
-        for key, pat in patterns.items():
-            m = re.search(pat, body_text, re.I)
-            if m:
-                data[key] = parse_count_text(m.group(1))
-                data["stats_extracted"] = True
+        labeled = extract_counters_from_body_text(body_text)
+        data.update(labeled)
         return data
 
     async def _extract_fallback(

@@ -44,6 +44,14 @@ if FASTAPI_AVAILABLE:
         require_cookies: bool = True
         auto_assign_proxy: bool = False
 
+    class FarmQueueBody(BaseModel):
+        account_ids: List[int] = Field(default_factory=list)
+        all_eligible: bool = False
+
+    class FarmSettingsBody(BaseModel):
+        max_concurrent: Optional[int] = None
+        session_minutes: Optional[int] = None
+
     class CookieUpdateBody(BaseModel):
         cookie_data: Any = ""
 
@@ -380,19 +388,6 @@ def _sync_storage_states_after_import(state, result: dict):
             pass
 
 
-def _assign_proxies_round_robin(state, items: List[dict]) -> None:
-    """Fill proxy_id=0 rows from alive proxy pool."""
-    proxies = state.proxy_manager.get_alive_proxies()
-    if not proxies:
-        return
-    idx = 0
-    for item in items:
-        if int(item.get("proxy_id") or 0) == 0:
-            p = proxies[idx % len(proxies)]
-            item["proxy_id"] = p.id
-            idx += 1
-
-
 @router.post("/accounts/import/seller")
 async def import_accounts_seller(request: Request, body: "SellerImportBody"):
     """Import accounts from seller format: USER|PASS|EMAIL|EMAIL_PASS|COOKIES|UID"""
@@ -408,7 +403,9 @@ async def import_accounts_seller(request: Request, body: "SellerImportBody"):
             )
 
         if body.auto_assign_proxy:
-            _assign_proxies_round_robin(state, items)
+            for item in items:
+                item["proxy_id"] = 0
+            state.proxy_manager.assign_proxies_for_import_items(state.db, items)
 
         acc_cfg = state.settings.get("accounts", {})
         require_cookies = body.require_cookies
@@ -506,9 +503,14 @@ async def delete_account(request: Request, account_id: int):
     """Delete an account."""
     state = get_state(request)
     try:
+        if not state.account_manager.get_account(account_id):
+            raise HTTPException(status_code=404, detail="Account not found")
         deleted = state.account_manager.delete_account(account_id)
         if not deleted:
-            raise HTTPException(status_code=404, detail="Account not found")
+            raise HTTPException(
+                status_code=500,
+                detail="Could not delete account (database error)",
+            )
         state.browser_manager.delete_storage_state(account_id)
         return {"success": True, "message": f"Account {account_id} deleted"}
     except HTTPException:
@@ -622,6 +624,47 @@ def _profile_scan_http_error(result: dict):
             "username": result.get("username"),
         },
     )
+
+
+@router.get("/settings/farm")
+async def get_farm_settings(request: Request):
+    """Farm queue: parallel sessions and session duration."""
+    state = get_state(request)
+    from src.main import farm_session_minutes
+
+    farm_cfg = state.settings.get("farm", {})
+    return {
+        "success": True,
+        "max_concurrent": getattr(state, "max_concurrent_farms", 3),
+        "session_minutes": farm_session_minutes(state.settings),
+        "config": {
+            "max_concurrent": int(farm_cfg.get("max_concurrent", 3)),
+            "session_minutes": farm_session_minutes(state.settings),
+        },
+        "queue": state.farm_queue.status() if getattr(state, "farm_queue", None) else None,
+    }
+
+
+@router.patch("/settings/farm")
+async def patch_farm_settings(request: Request, body: "FarmSettingsBody" = Body(...)):
+    """Update farm parallelism / session length (saved to config/settings.yaml)."""
+    state = get_state(request)
+    if body.max_concurrent is None and body.session_minutes is None:
+        raise HTTPException(status_code=400, detail="Provide max_concurrent and/or session_minutes")
+    try:
+        updated = state.apply_farm_settings(
+            max_concurrent=body.max_concurrent,
+            session_minutes=body.session_minutes,
+        )
+        return {
+            "success": True,
+            "message": "Farm settings updated",
+            **updated,
+            "queue": state.farm_queue.status() if getattr(state, "farm_queue", None) else None,
+        }
+    except Exception as e:
+        logger.error(f"Error updating farm settings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/profile/status")
@@ -998,6 +1041,51 @@ async def get_health(request: Request):
 
 
 # ---- Action Endpoints ----
+# Farm queue routes MUST be registered before /actions/farm/{account_id}
+
+
+@router.post("/actions/farm/queue")
+async def enqueue_farm_queue(request: Request, body: "FarmQueueBody" = Body(...)):
+    """Queue accounts for farm; worker runs max_concurrent at a time (rotation)."""
+    state = get_state(request)
+    if not getattr(state, "farm_queue", None):
+        raise HTTPException(status_code=503, detail="Farm queue not available; restart server")
+    ids = list(body.account_ids or [])
+    if body.all_eligible or not ids:
+        ids = [
+            a.id
+            for a in state.account_manager.get_all_accounts()
+            if a.status in ("active", "warming", "pending")
+        ]
+    if not ids:
+        raise HTTPException(status_code=400, detail="No accounts to queue")
+    result = state.farm_queue.enqueue(ids)
+    return {
+        "success": True,
+        "message": f"Queued {result['added']} account(s), {result['pending']} waiting",
+        **result,
+        "queue": state.farm_queue.status(),
+    }
+
+
+@router.get("/actions/farm/queue")
+async def farm_queue_status(request: Request):
+    """Pending / running farm queue snapshot."""
+    state = get_state(request)
+    if not getattr(state, "farm_queue", None):
+        raise HTTPException(status_code=503, detail="Farm queue not available; restart server")
+    return {"success": True, **state.farm_queue.status()}
+
+
+@router.delete("/actions/farm/queue")
+async def clear_farm_queue(request: Request):
+    """Clear pending queue (does not stop running sessions)."""
+    state = get_state(request)
+    if not getattr(state, "farm_queue", None):
+        raise HTTPException(status_code=503, detail="Farm queue not available; restart server")
+    cleared = state.farm_queue.clear_pending()
+    return {"success": True, "cleared": cleared, "queue": state.farm_queue.status()}
+
 
 @router.post("/actions/farm/{account_id}")
 async def trigger_farm(
@@ -1012,8 +1100,19 @@ async def trigger_farm(
         if not account:
             raise HTTPException(status_code=404, detail="Account not found")
 
-        if state.farm_engine.is_running or account_id in state.active_farm_tasks:
-            raise HTTPException(status_code=409, detail="Farm session already running for this account")
+        if account_id in state.active_farm_tasks:
+            raise HTTPException(
+                status_code=409,
+                detail="Farm session already running for this account",
+            )
+
+        active_count = len(state.active_farm_tasks)
+        max_c = getattr(state, "max_concurrent_farms", 3)
+        if active_count >= max_c:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Max concurrent farm sessions ({max_c}). Wait for one to finish.",
+            )
 
         proxy = _account_proxy_url(state, account)
         session_id = f"farm_{account_id}_{int(time.time())}"
@@ -1021,13 +1120,15 @@ async def trigger_farm(
         state.active_farm_tasks[account_id] = session_id
 
         async def _run_farm():
+            engine = state.make_farm_engine()
             try:
-                await state.farm_engine.run_farm_session(
-                    account_id=account_id,
-                    proxy_url=proxy,
-                    duration_minutes=duration,
-                    session_id=session_id,
-                )
+                async with state.farm_semaphore:
+                    await engine.run_farm_session(
+                        account_id=account_id,
+                        proxy_url=proxy,
+                        duration_minutes=duration,
+                        session_id=session_id,
+                    )
             finally:
                 state.active_farm_tasks.pop(account_id, None)
 
@@ -1039,6 +1140,8 @@ async def trigger_farm(
             "session_id": session_id,
             "ws_url": f"/api/ws/{session_id}",
             "task_id": id(task),
+            "active_farms": len(state.active_farm_tasks),
+            "max_concurrent": max_c,
         }
     except HTTPException:
         raise

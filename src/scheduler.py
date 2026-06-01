@@ -77,6 +77,11 @@ class FarmScheduler:
         self._max_retries = 3
         self._account_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._farm_active: Set[int] = set()
+        self.active_farm_tasks: Optional[dict] = None
+        self.farm_semaphore = None
+        self.make_farm_engine = None
+        self.event_bus = None
+        self.max_concurrent_farms = 3
 
         # Scheduler config
         scheduler_config = settings.get("scheduler", {})
@@ -369,12 +374,49 @@ class FarmScheduler:
                 }
                 duration = self.farm_session_minutes
 
-            session_stats = await self.farm_engine.run_farm_session(
-                account_id=account_id,
-                proxy_url=session["proxy_url"],
-                duration_minutes=duration,
-                actions=actions,
+            active = self.active_farm_tasks
+            if active is not None and account_id in active:
+                logger.info(f"Skipping scheduled farm {account_id}: manual farm already running")
+                return
+            if active is not None:
+                while len(active) >= self.max_concurrent_farms:
+                    await asyncio.sleep(5)
+
+            engine = (
+                self.make_farm_engine()
+                if self.make_farm_engine
+                else self.farm_engine
             )
+            session_id = f"farm_{account_id}_{int(datetime.now().timestamp())}"
+            if self.event_bus:
+                if not self.event_bus.has_session(session_id):
+                    self.event_bus.create_session(session_id)
+            if active is not None:
+                active[account_id] = session_id
+
+            async def _run():
+                if self.farm_semaphore:
+                    async with self.farm_semaphore:
+                        return await engine.run_farm_session(
+                            account_id=account_id,
+                            proxy_url=session["proxy_url"],
+                            duration_minutes=duration,
+                            actions=actions,
+                            session_id=session_id,
+                        )
+                return await engine.run_farm_session(
+                    account_id=account_id,
+                    proxy_url=session["proxy_url"],
+                    duration_minutes=duration,
+                    actions=actions,
+                    session_id=session_id,
+                )
+
+            try:
+                session_stats = await _run()
+            finally:
+                if active is not None:
+                    active.pop(account_id, None)
 
             # Log activity
             if session_stats.get("completed"):
@@ -768,3 +810,19 @@ class FarmScheduler:
         )
         inst.affiliate_pipeline = affiliate_pipeline
         return inst
+
+    def bind_farm_runtime(
+        self,
+        *,
+        active_farm_tasks: dict,
+        farm_semaphore,
+        make_farm_engine,
+        event_bus,
+        max_concurrent_farms: int = 3,
+    ):
+        """Share manual-farm concurrency limits with API / farm queue."""
+        self.active_farm_tasks = active_farm_tasks
+        self.farm_semaphore = farm_semaphore
+        self.make_farm_engine = make_farm_engine
+        self.event_bus = event_bus
+        self.max_concurrent_farms = max(1, int(max_concurrent_farms))

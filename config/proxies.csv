@@ -1,5 +1,3 @@
 ip,port,protocol,username,password,status
 14.225.43.178,6666,http,VN375441,aRVD8f9c,active
-14.225.43.178,7777,socks5,VN375441,aRVD8f9c,inactive
 14.225.48.219,62341,http,VN258262,vZyT7u8A,active
-14.225.48.219,62342,socks5,VN258262,vZyT7u8A,inactive

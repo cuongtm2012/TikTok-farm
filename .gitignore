@@ -2,27 +2,68 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
 *.egg-info/
 .eggs/
 dist/
 build/
 .venv/
 venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+*.cover
+
+# Environment & secrets
 .env
 .env.*
 !.env.example
+config/accounts.local.yaml
+config/settings.local.yaml
+config/proxies.local.csv
 
-# Runtime data
+# SQLite / local database
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Runtime data (keep tracked samples under data/affiliate/)
 data/*.db
+data/*.db-*
 data/posts/
-logs/
+data/uploads/
+data/previews/
+!data/affiliate/
+!data/affiliate/**
+
+# Browser profiles & session state
 profiles/
+playwright/.cache/
+.ms-playwright/
+
+# Logs
+logs/
+*.log
 
 # IDE / OS
 .idea/
 .vscode/
-.DS_Store
+.cursor/
 *.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
-# Secrets (use config examples in repo)
-config/accounts.local.yaml
+# Docker / local overrides
+docker-compose.override.yml
+
+# Misc local scripts (often contain pasted cookies)
+import_cookie_*.py
+update_cookie_*.py

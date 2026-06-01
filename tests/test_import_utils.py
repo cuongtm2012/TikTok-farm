@@ -6,7 +6,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.import_utils import parse_cookie_string, parse_seller_line, parse_seller_bulk
+from src.import_utils import (
+    parse_cookie_string,
+    parse_seller_cookie_field,
+    parse_seller_line,
+    parse_seller_bulk,
+)
 
 
 def test_parse_cookie_string():
@@ -40,9 +45,31 @@ def test_parse_seller_bulk_skips_empty():
     assert len(errs) == 0
 
 
+def test_parse_seller_bare_sessionid():
+    row = parse_seller_line("user2|pass2|e@x.com|mp|deadbeefsessiontoken|uid42")
+    cookies = json.loads(row["cookie_data"])
+    assert cookies[0]["name"] == "sessionid"
+    assert cookies[0]["value"] == "deadbeefsessiontoken"
+
+
+def test_parse_seller_three_field():
+    row = parse_seller_line("user3|pass3|sessionid=xyz")
+    assert row["username"] == "user3"
+    assert any(c["name"] == "sessionid" for c in json.loads(row["cookie_data"]))
+
+
+def test_parse_seller_cookie_field_json_object():
+    cookies = parse_seller_cookie_field('{"sessionid": "abc", "msToken": "t1"}')
+    names = {c["name"] for c in cookies}
+    assert "sessionid" in names and "msToken" in names
+
+
 if __name__ == "__main__":
     test_parse_cookie_string()
     test_parse_seller_line_basic()
     test_parse_seller_line_cookie_with_pipe()
     test_parse_seller_bulk_skips_empty()
+    test_parse_seller_bare_sessionid()
+    test_parse_seller_three_field()
+    test_parse_seller_cookie_field_json_object()
     print("All tests passed")

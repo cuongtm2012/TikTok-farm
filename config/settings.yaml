@@ -13,6 +13,11 @@ proxies:
   check_timeout: 10
   max_fail_before_disable: 3
 
+# Farm: 3 parallel sessions on 8GB VPS; queue rotates through all accounts
+farm:
+  max_concurrent: 3
+  session_minutes: 15
+
 scheduler:
   posts_per_day: 3
   farm_sessions_per_day: 3

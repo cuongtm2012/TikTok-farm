@@ -534,10 +534,24 @@ class AccountManager:
             return None
 
     def delete_account(self, account_id: int) -> bool:
-        """Delete an account by ID. Returns True if deleted."""
+        """Delete an account and related rows (posts, activities, alerts, logs)."""
+        if not self.get_account(account_id):
+            return False
+        child_tables = ("posts", "farm_activities", "alerts", "account_logs")
         try:
             conn = self._get_conn()
             cursor = conn.cursor()
+            for table in child_tables:
+                try:
+                    cursor.execute(
+                        self.db.sql(f"DELETE FROM {table} WHERE account_id = ?"),
+                        (account_id,),
+                    )
+                except Exception as e:
+                    if table == "account_logs":
+                        logger.debug(f"No account_logs table or skip: {e}")
+                    else:
+                        raise
             cursor.execute(
                 self.db.sql("DELETE FROM accounts WHERE id = ?"),
                 (account_id,),
@@ -546,9 +560,7 @@ class AccountManager:
             conn.commit()
             conn.close()
             if deleted:
-                logger.info(f"Deleted account {account_id}")
-            else:
-                logger.warning(f"Account {account_id} not found for deletion")
+                logger.info(f"Deleted account {account_id} and related data")
             return deleted
         except Exception as e:
             logger.error(f"Failed to delete account {account_id}: {e}")
